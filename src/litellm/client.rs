@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use crate::config::Credentials;
 
 use super::budget::BudgetInfo;
-use super::models::{ModelSpec, parse_model_group_info};
+use super::models::{ModelSpec, parse_model_group_info, parse_model_info};
 
 pub struct Client {
     http: reqwest::Client,
@@ -90,13 +90,17 @@ impl Client {
         }
     }
 
-    /// Chat models with limits, capabilities and pricing. Falls back to bare ids from
-    /// `/v1/models` when `/model_group/info` is unavailable, and adds ids it doesn't list.
+    /// Chat models with limits, capabilities and pricing. `/model/info` carries cache prices
+    /// and long-context tiers; `/model_group/info` is the fallback when that route is blocked.
+    /// `/model/info` lists load-balanced deployments separately, so the first one per name wins.
     pub async fn models(&self) -> Result<Vec<ModelSpec>> {
         let ids = self.list_model_ids().await?;
-        let mut specs = match self.get_json("/model_group/info").await? {
-            Fetch::Ok(body) => parse_model_group_info(&body),
-            Fetch::Denied(_) => Vec::new(),
+        let mut specs = match self.get_json("/model/info").await? {
+            Fetch::Ok(body) => parse_model_info(&body),
+            Fetch::Denied(_) => match self.get_json("/model_group/info").await? {
+                Fetch::Ok(body) => parse_model_group_info(&body),
+                Fetch::Denied(_) => Vec::new(),
+            },
         };
         let has_info = !specs.is_empty();
         specs.retain(|spec| ids.is_empty() || ids.contains(&spec.id));
@@ -106,6 +110,7 @@ impl Client {
             }
         }
         specs.sort_by(|a, b| a.id.cmp(&b.id));
+        specs.dedup_by(|a, b| a.id == b.id);
         Ok(specs)
     }
 

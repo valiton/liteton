@@ -235,9 +235,18 @@ fn select_models(
     for m in models {
         let mut hint = format!(
             "{} in · {} out per 1M",
-            format_cost(m.input_cost),
-            format_cost(m.output_cost)
+            format_cost(m.pricing.input),
+            format_cost(m.pricing.output)
         );
+        if let Some(tier) = m.long_context()
+            && tier.pricing.input.is_some()
+        {
+            hint.push_str(&format!(
+                " · {} in >{}",
+                format_cost(tier.pricing.input),
+                format_tokens(Some(tier.above_tokens))
+            ));
+        }
         if m.context_window.is_some() {
             hint.push_str(&format!(" · {} ctx", format_tokens(m.context_window)));
         }

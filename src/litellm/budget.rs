@@ -84,11 +84,12 @@ fn parse_timestamp(s: &str) -> Option<DateTime<Utc>> {
 }
 
 /// Key budget first, then the user's budget when the key has none, then (opt-in) response headers.
+/// `Ok(None)` means the key may not read its budget and pinging wasn't allowed.
 pub async fn fetch_budget(
     client: &Client,
     models: &[ModelSpec],
     allow_ping: bool,
-) -> Result<BudgetInfo> {
+) -> Result<Option<BudgetInfo>> {
     let key = match client.key_info().await? {
         Fetch::Ok(body) => BudgetInfo::from_info(&body, BudgetSource::Key),
         Fetch::Denied(_) => None,
@@ -96,32 +97,28 @@ pub async fn fetch_budget(
     if let Some(key) = &key
         && key.max_budget.is_some()
     {
-        return Ok(key.clone());
+        return Ok(Some(key.clone()));
     }
     if let Fetch::Ok(body) = client.user_info().await?
         && let Some(user) = BudgetInfo::from_info(&body, BudgetSource::User)
         && user.max_budget.is_some()
     {
-        return Ok(user);
+        return Ok(Some(user));
     }
-    if let Some(key) = key {
+    if key.is_some() || !allow_ping {
         return Ok(key);
-    }
-    if !allow_ping {
-        bail!(
-            "this key may not read /key/info or /user/info; rerun with --ping to read the budget from response headers"
-        );
     }
     let Some(model) = cheapest(models) else {
         bail!("no model available for the budget ping")
     };
-    client.ping_budget(&model.id).await
+    client.ping_budget(&model.id).await.map(Some)
 }
 
 fn cheapest(models: &[ModelSpec]) -> Option<&ModelSpec> {
     models.iter().min_by(|a, b| {
-        let cost =
-            |m: &ModelSpec| m.input_cost.unwrap_or(f64::MAX) + m.output_cost.unwrap_or(f64::MAX);
+        let cost = |m: &ModelSpec| {
+            m.pricing.input.unwrap_or(f64::MAX) + m.pricing.output.unwrap_or(f64::MAX)
+        };
         cost(a).total_cmp(&cost(b))
     })
 }

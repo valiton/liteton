@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use chrono::{DateTime, Utc};
 use crossterm::style::{Color, Stylize};
 use tokio::runtime::Runtime;
@@ -20,6 +20,11 @@ pub fn usage(rt: &Runtime, json: bool, ping: bool) -> Result<()> {
             Vec::new()
         };
         fetch_budget(&client, &models, ping).await
+    })?
+    .ok_or_else(|| {
+        anyhow!(
+            "this key may not read /key/info or /user/info; rerun with --ping to read the budget from response headers"
+        )
     })?;
     if json {
         println!("{}", serde_json::to_string_pretty(&info)?);

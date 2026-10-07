@@ -227,8 +227,11 @@ pub mod tests {
         ModelSpec {
             context_window: Some(400000),
             max_output_tokens: Some(128000),
-            input_cost: Some(0.05),
-            output_cost: Some(0.4),
+            pricing: crate::litellm::Pricing {
+                input: Some(0.05),
+                output: Some(0.4),
+                ..Default::default()
+            },
             vision: true,
             reasoning,
             ..ModelSpec::bare(id)

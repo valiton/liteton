@@ -9,7 +9,7 @@ use super::{
 };
 use crate::config::{Config, HarnessRecord};
 use crate::jsonc;
-use crate::litellm::ModelSpec;
+use crate::litellm::{ModelSpec, Pricing};
 
 pub struct OpenCode {
     config_dir: PathBuf,
@@ -247,15 +247,15 @@ fn model_entry(model: &ModelSpec, config: &Config) -> Value {
             json!({"context": context, "output": output}),
         );
     }
-    if let (Some(input), Some(output)) = (model.input_cost, model.output_cost) {
-        let mut cost = Map::new();
-        cost.insert("input".into(), json!(input));
-        cost.insert("output".into(), json!(output));
-        if let Some(read) = model.cache_read_cost {
-            cost.insert("cache_read".into(), json!(read));
-        }
-        if let Some(write) = model.cache_write_cost {
-            cost.insert("cache_write".into(), json!(write));
+    if let Some(mut cost) = cost_object(&model.pricing) {
+        // opencode only knows a 200k boundary. Gotta write 272k as 200k.
+        if let Some(long) = model
+            .tiers
+            .iter()
+            .find(|tier| tier.above_tokens == 200_000)
+            .and_then(|tier| cost_object(&tier.pricing))
+        {
+            cost.insert("context_over_200k".into(), Value::Object(long));
         }
         entry.insert("cost".into(), Value::Object(cost));
     }
@@ -270,11 +270,28 @@ fn model_entry(model: &ModelSpec, config: &Config) -> Value {
     Value::Object(entry)
 }
 
+fn cost_object(pricing: &Pricing) -> Option<Map<String, Value>> {
+    let (Some(input), Some(output)) = (pricing.input, pricing.output) else {
+        return None;
+    };
+    let mut cost = Map::new();
+    cost.insert("input".into(), json!(input));
+    cost.insert("output".into(), json!(output));
+    if let Some(read) = pricing.cache_read {
+        cost.insert("cache_read".into(), json!(read));
+    }
+    if let Some(write) = pricing.cache_write {
+        cost.insert("cache_write".into(), json!(write));
+    }
+    Some(cost)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::config::Credentials;
     use crate::harness::tests::{paths_in, spec};
+    use crate::litellm::PriceTier;
 
     const USER_CONFIG: &str = r#"{
   "mcp": {
@@ -438,5 +455,28 @@ mod tests {
         )
         .unwrap();
         assert!(value["provider"]["litellm"]["models"]["mine"].is_object());
+    }
+
+    #[test]
+    fn writes_only_the_200k_tier_as_context_over_200k() {
+        let tier = |above_tokens, input| PriceTier {
+            above_tokens,
+            pricing: Pricing {
+                input: Some(input),
+                output: Some(input * 4.0),
+                ..Default::default()
+            },
+        };
+        let mut model = spec("gpt", false);
+        model.tiers = vec![tier(272_000, 0.2)];
+        let entry = model_entry(&model, &Config::default());
+        assert_eq!(entry["cost"], json!({"input": 0.05, "output": 0.4}));
+
+        model.tiers = vec![tier(200_000, 1.0), tier(272_000, 2.0)];
+        let entry = model_entry(&model, &Config::default());
+        assert_eq!(
+            entry["cost"]["context_over_200k"],
+            json!({"input": 1.0, "output": 4.0})
+        );
     }
 }
