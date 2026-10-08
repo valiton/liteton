@@ -26,19 +26,21 @@ impl SafeStorage {
 
     /// Reads the app's "<App> Safe Storage" Keychain item; macOS asks the user to allow this.
     ///
-    /// The account name varies between Electron versions ("Code" vs. "Code Key"), so when the
-    /// expected account is not found, fall back to any generic password with that service.
-    pub fn from_keychain(service: &str, account: &str) -> Result<Self> {
-        let password = match security_framework::passwords::get_generic_password(service, account)
-        {
-            Ok(password) => password,
-            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => find_by_service(service)?,
-            Err(e) => {
-                return Err(anyhow!(e))
-                    .with_context(|| format!("reading \"{service}\" from the Keychain"));
+    /// The account name varies between Electron versions ("Code" vs. "Code Key"), so each
+    /// candidate account is tried in order; if none is found, fall back to any generic password
+    /// with that service.
+    pub fn from_keychain(service: &str, accounts: &[&str]) -> Result<Self> {
+        for account in accounts {
+            match security_framework::passwords::get_generic_password(service, account) {
+                Ok(password) => return Ok(Self::from_password(&password)),
+                Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => continue,
+                Err(e) => {
+                    return Err(anyhow!(e))
+                        .with_context(|| format!("reading \"{service}\" from the Keychain"));
+                }
             }
-        };
-        Ok(Self::from_password(&password))
+        }
+        Ok(Self::from_password(&find_by_service(service)?))
     }
 
     pub fn encrypt(&self, plaintext: &str) -> Vec<u8> {

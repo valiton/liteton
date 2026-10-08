@@ -109,11 +109,11 @@ impl ElectronApp {
             .join("User")
     }
 
-    /// Keychain (service, account) holding the app's safeStorage password.
-    pub fn keychain_item(self) -> (&'static str, &'static str) {
+    /// Keychain service and candidate accounts holding the app's safeStorage password.
+    pub fn keychain_item(self) -> (&'static str, &'static [&'static str]) {
         match self {
-            Self::VSCode => ("Code Safe Storage", "Code Key"),
-            Self::Cursor => ("Cursor Safe Storage", "Cursor Key"),
+            Self::VSCode => ("Code Safe Storage", &["Code Key", "Code"]),
+            Self::Cursor => ("Cursor Safe Storage", &["Cursor Key", "Cursor"]),
         }
     }
 
@@ -163,8 +163,8 @@ impl ElectronApp {
 
     /// Unlocks safeStorage and proves the derived key decrypts a secret the app wrote itself.
     pub fn unlock_secrets(self, db: &StateDb) -> Result<SecretWriter> {
-        let (service, account) = self.keychain_item();
-        let storage = SafeStorage::from_keychain(service, account)?;
+        let (service, accounts) = self.keychain_item();
+        let storage = SafeStorage::from_keychain(service, accounts)?;
         let existing = db.keys_with_prefix("secret://")?;
         let mut verified = false;
         for key in existing {
