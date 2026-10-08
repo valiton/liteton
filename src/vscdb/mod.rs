@@ -112,8 +112,8 @@ impl ElectronApp {
     /// Keychain (service, account) holding the app's safeStorage password.
     pub fn keychain_item(self) -> (&'static str, &'static str) {
         match self {
-            Self::VSCode => ("Code Safe Storage", "Code"),
-            Self::Cursor => ("Cursor Safe Storage", "Cursor"),
+            Self::VSCode => ("Code Safe Storage", "Code Key"),
+            Self::Cursor => ("Cursor Safe Storage", "Cursor Key"),
         }
     }
 

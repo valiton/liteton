@@ -25,10 +25,19 @@ impl SafeStorage {
     }
 
     /// Reads the app's "<App> Safe Storage" Keychain item; macOS asks the user to allow this.
+    ///
+    /// The account name varies between Electron versions ("Code" vs. "Code Key"), so when the
+    /// expected account is not found, fall back to any generic password with that service.
     pub fn from_keychain(service: &str, account: &str) -> Result<Self> {
-        let password = security_framework::passwords::get_generic_password(service, account)
-            .map_err(|e| anyhow!(e))
-            .with_context(|| format!("reading \"{service}\" from the Keychain"))?;
+        let password = match security_framework::passwords::get_generic_password(service, account)
+        {
+            Ok(password) => password,
+            Err(e) if e.code() == ERR_SEC_ITEM_NOT_FOUND => find_by_service(service)?,
+            Err(e) => {
+                return Err(anyhow!(e))
+                    .with_context(|| format!("reading \"{service}\" from the Keychain"));
+            }
+        };
         Ok(Self::from_password(&password))
     }
 
@@ -47,6 +56,27 @@ impl SafeStorage {
             .map_err(|_| anyhow!("could not decrypt the secret with the Keychain password"))?;
         String::from_utf8(plaintext).context("decrypted secret is not valid UTF-8")
     }
+}
+
+const ERR_SEC_ITEM_NOT_FOUND: i32 = -25300;
+
+fn find_by_service(service: &str) -> Result<Vec<u8>> {
+    use security_framework::item::{ItemClass, ItemSearchOptions, Limit, SearchResult};
+    let results = ItemSearchOptions::new()
+        .class(ItemClass::generic_password())
+        .service(service)
+        .load_data(true)
+        .limit(Limit::Max(1))
+        .search()
+        .map_err(|e| anyhow!(e))
+        .with_context(|| format!("reading \"{service}\" from the Keychain"))?;
+    results
+        .into_iter()
+        .find_map(|result| match result {
+            SearchResult::Data(data) => Some(data),
+            _ => None,
+        })
+        .with_context(|| format!("reading \"{service}\" from the Keychain: no password data"))
 }
 
 /// `{"type":"Buffer","data":[...]}`, the shape `JSON.stringify(Buffer)` produces.
