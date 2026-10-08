@@ -4,4 +4,4 @@ pub mod models;
 
 pub use budget::BudgetInfo;
 pub use client::Client;
-pub use models::ModelSpec;
+pub use models::{ModelSpec, PriceTier, Pricing};

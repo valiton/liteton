@@ -7,7 +7,7 @@ use tokio::runtime::Runtime;
 use super::{change_preview, format_cost, format_tokens};
 use crate::cli::InstallArgs;
 use crate::config::{self, Config, InstallState};
-use crate::harness::{self, Harness, HarnessId, HarnessPaths, InstallCtx, Plan, cursor};
+use crate::harness::{self, Harness, HarnessId, HarnessPaths, InstallCtx, Plan, cursor, opencode};
 use crate::litellm::{Client, ModelSpec};
 use crate::vscdb::{SecretWriter, StateDb};
 
@@ -49,6 +49,9 @@ pub fn install(rt: &Runtime, args: InstallArgs) -> Result<()> {
 
     if selected.contains(&HarnessId::Cursor) && !confirm_cursor(&creds.base_url, args.yes)? {
         selected.retain(|id| *id != HarnessId::Cursor);
+    }
+    if selected.contains(&HarnessId::Opencode) {
+        decide_opencode_long_context(&mut config, &chosen, args.yes)?;
     }
 
     let ctx = InstallCtx {
@@ -235,9 +238,18 @@ fn select_models(
     for m in models {
         let mut hint = format!(
             "{} in · {} out per 1M",
-            format_cost(m.input_cost),
-            format_cost(m.output_cost)
+            format_cost(m.pricing.input),
+            format_cost(m.pricing.output)
         );
+        if let Some(tier) = m.long_context()
+            && tier.pricing.input.is_some()
+        {
+            hint.push_str(&format!(
+                " · {} in >{}",
+                format_cost(tier.pricing.input),
+                format_tokens(Some(tier.above_tokens))
+            ));
+        }
         if m.context_window.is_some() {
             hint.push_str(&format!(" · {} ctx", format_tokens(m.context_window)));
         }
@@ -269,6 +281,74 @@ fn confirm_cursor(base_url: &str, yes: bool) -> Result<bool> {
     Ok(cliclack::confirm("Configure Cursor anyway?")
         .initial_value(false)
         .interact()?)
+}
+
+/// opencode prices long prompts only from 200k on. Asks once whether later tiers may stand in,
+/// and remembers the answer in config.toml.
+fn decide_opencode_long_context(
+    config: &mut Config,
+    models: &[ModelSpec],
+    yes: bool,
+) -> Result<()> {
+    let affected: Vec<(&str, u64)> = models
+        .iter()
+        .filter_map(|m| {
+            opencode::approximated_tier(m).map(|tier| (m.id.as_str(), tier.above_tokens))
+        })
+        .collect();
+    if affected.is_empty() {
+        return Ok(());
+    }
+    let setting = format!(
+        "{} in {}",
+        "opencode_approximate_long_context".bold(),
+        config::config_file().display()
+    );
+    match config.opencode_approximate_long_context {
+        Some(true) => cliclack::log::remark(format!(
+            "opencode: long-context rates are approximated from 200k on.\n{}",
+            format!("Set by {setting}").dark_grey()
+        ))?,
+        Some(false) => {}
+        None if yes => {}
+        None => {
+            let width = affected.iter().map(|(id, _)| id.len()).max().unwrap_or(0);
+            let list: Vec<String> = affected
+                .iter()
+                .map(|(id, above)| {
+                    format!(
+                        "  {id:width$}  {}",
+                        format!("above {}", format_tokens(Some(*above))).yellow()
+                    )
+                })
+                .collect();
+            let mut thresholds: Vec<u64> = affected.iter().map(|(_, above)| *above).collect();
+            thresholds.sort_unstable();
+            thresholds.dedup();
+            let until = match thresholds.as_slice() {
+                [only] => format_tokens(Some(*only)),
+                _ => "each model's threshold".to_string(),
+            };
+            cliclack::log::warning(format!(
+                "opencode can only price long prompts from 200k tokens on.\n\
+                 These models switch to their long-context rate later:\n\
+                 {}\n\n\
+                 Yes: opencode uses the long-context rate from 200k on,\n\
+                 \x20    overestimating prompts between 200k and {until}.\n\
+                 No:  opencode shows the normal rate for every prompt.\n\
+                 {}",
+                list.join("\n"),
+                "Either way, LiteLLM bills the real rate.".dark_grey()
+            ))?;
+            let approximate = cliclack::confirm("Approximate long-context pricing in opencode?")
+                .initial_value(false)
+                .interact()?;
+            config.opencode_approximate_long_context = Some(approximate);
+            config.save()?;
+            cliclack::log::remark(format!("Saved. To change it later, edit {setting}"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Previews, confirms, closes apps if needed, backs up, applies and records each plan.
