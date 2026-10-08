@@ -17,6 +17,11 @@ pub struct Config {
     pub reasoning_efforts: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub model_reasoning_efforts: BTreeMap<String, Vec<String>>,
+    /// opencode prices long prompts only from 200k tokens on. `true` writes a later tier
+    /// (e.g. above 272k) there, so opencode overestimates requests between 200k and that
+    /// threshold. Unset means `liteton install` asks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub opencode_approximate_long_context: Option<bool>,
 }
 
 impl Config {
@@ -133,7 +138,7 @@ pub fn config_dir() -> PathBuf {
     xdg_config_home().join("liteton")
 }
 
-fn config_file() -> PathBuf {
+pub fn config_file() -> PathBuf {
     config_dir().join("config.toml")
 }
 

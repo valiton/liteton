@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, anyhow};
+use jsonc_parser::cst::CstObject;
 use serde_json::{Map, Value, json};
 
 use super::{
@@ -9,7 +10,7 @@ use super::{
 };
 use crate::config::{Config, HarnessRecord};
 use crate::jsonc;
-use crate::litellm::{ModelSpec, Pricing};
+use crate::litellm::{ModelSpec, PriceTier, Pricing};
 
 pub struct OpenCode {
     config_dir: PathBuf,
@@ -100,6 +101,9 @@ impl Harness for OpenCode {
             let mut entry = Map::new();
             entry.insert(model.id.clone(), value);
             jsonc::merge_object(&models, &entry);
+            if ctx.config.opencode_approximate_long_context != Some(true) {
+                drop_approximation(&models, model);
+            }
         }
         let removed = deselected(record, ctx.models);
         for id in &removed {
@@ -248,12 +252,9 @@ fn model_entry(model: &ModelSpec, config: &Config) -> Value {
         );
     }
     if let Some(mut cost) = cost_object(&model.pricing) {
-        // opencode only knows a 200k boundary. Gotta write 272k as 200k.
-        if let Some(long) = model
-            .tiers
-            .iter()
-            .find(|tier| tier.above_tokens == 200_000)
-            .and_then(|tier| cost_object(&tier.pricing))
+        let approximate = config.opencode_approximate_long_context == Some(true);
+        if let Some(long) =
+            over_200k_tier(model, approximate).and_then(|tier| cost_object(&tier.pricing))
         {
             cost.insert("context_over_200k".into(), Value::Object(long));
         }
@@ -268,6 +269,39 @@ fn model_entry(model: &ModelSpec, config: &Config) -> Value {
         entry.insert("variants".into(), Value::Object(variants));
     }
     Value::Object(entry)
+}
+
+/// opencode's config has one long-context slot, fixed at 200k.
+fn over_200k_tier(model: &ModelSpec, approximate: bool) -> Option<&PriceTier> {
+    let exact = model.tiers.iter().find(|tier| tier.above_tokens == 200_000);
+    exact.or_else(|| approximated_tier(model).filter(|_| approximate))
+}
+
+/// The tier that would stand in for 200k: the lowest priced one above it, when none sits at 200k.
+pub fn approximated_tier(model: &ModelSpec) -> Option<&PriceTier> {
+    if model.tiers.iter().any(|tier| tier.above_tokens == 200_000) {
+        return None;
+    }
+    model
+        .tiers
+        .iter()
+        .find(|tier| tier.above_tokens > 200_000 && cost_object(&tier.pricing).is_some())
+}
+
+/// After opting out, removes a `context_over_200k` that is exactly the approximation liteton
+/// wrote before. A value the user typed in is kept.
+fn drop_approximation(models: &CstObject, model: &ModelSpec) {
+    let Some(written) = approximated_tier(model).and_then(|tier| cost_object(&tier.pricing)) else {
+        return;
+    };
+    if let Some(cost) = models
+        .object_value(&model.id)
+        .and_then(|entry| entry.object_value("cost"))
+        && let Some(prop) = cost.get("context_over_200k")
+        && prop.value().and_then(|v| jsonc::node_to_value(&v)) == Some(Value::Object(written))
+    {
+        prop.remove();
+    }
 }
 
 fn cost_object(pricing: &Pricing) -> Option<Map<String, Value>> {
@@ -291,7 +325,6 @@ mod tests {
     use super::*;
     use crate::config::Credentials;
     use crate::harness::tests::{paths_in, spec};
-    use crate::litellm::PriceTier;
 
     const USER_CONFIG: &str = r#"{
   "mcp": {
@@ -468,15 +501,109 @@ mod tests {
             },
         };
         let mut model = spec("gpt", false);
+        model.pricing.cache_read = Some(0.005);
+        model.pricing.cache_write = Some(0.0625);
         model.tiers = vec![tier(272_000, 0.2)];
         let entry = model_entry(&model, &Config::default());
-        assert_eq!(entry["cost"], json!({"input": 0.05, "output": 0.4}));
+        assert_eq!(
+            entry["cost"],
+            json!({"input": 0.05, "output": 0.4, "cache_read": 0.005, "cache_write": 0.0625})
+        );
 
         model.tiers = vec![tier(200_000, 1.0), tier(272_000, 2.0)];
         let entry = model_entry(&model, &Config::default());
         assert_eq!(
             entry["cost"]["context_over_200k"],
             json!({"input": 1.0, "output": 4.0})
+        );
+
+        let approximate = Config {
+            opencode_approximate_long_context: Some(true),
+            ..Config::default()
+        };
+        let entry = model_entry(&model, &approximate);
+        assert_eq!(
+            entry["cost"]["context_over_200k"],
+            json!({"input": 1.0, "output": 4.0}),
+            "an exact 200k tier still wins"
+        );
+        model.tiers = vec![tier(128_000, 0.1), tier(272_000, 2.0), tier(512_000, 3.0)];
+        let entry = model_entry(&model, &approximate);
+        assert_eq!(
+            entry["cost"]["context_over_200k"],
+            json!({"input": 2.0, "output": 8.0}),
+            "the lowest tier above 200k stands in"
+        );
+    }
+
+    #[test]
+    fn opting_out_removes_only_our_approximation() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let creds = Credentials {
+            base_url: "https://llm.example.com".into(),
+            api_key: "sk-1".into(),
+        };
+        let mut luna = spec("gpt-6-luna", false);
+        luna.tiers = vec![PriceTier {
+            above_tokens: 272_000,
+            pricing: Pricing {
+                input: Some(0.2),
+                output: Some(0.75),
+                ..Default::default()
+            },
+        }];
+        let mut astra = luna.clone();
+        astra.id = "gpt-6-astra".into();
+        let models = vec![luna, astra];
+        let harness = OpenCode::new(&paths);
+        let install = |config: &Config| {
+            let plan = harness
+                .plan_install(&ctx(&creds, &models, config), None)
+                .unwrap();
+            crate::harness::apply::apply(&plan, &dir.path().join("backup"), None).unwrap();
+        };
+        let config_path = paths.opencode_config_dir.join("opencode.jsonc");
+        let read = || jsonc::read_value(&std::fs::read_to_string(&config_path).unwrap()).unwrap();
+
+        install(&Config {
+            opencode_approximate_long_context: Some(true),
+            ..Config::default()
+        });
+        let models_path =
+            |value: &Value, id: &str| value["provider"]["litellm"]["models"][id].clone();
+        assert_eq!(
+            models_path(&read(), "gpt-6-luna")["cost"]["context_over_200k"],
+            json!({"input": 0.2, "output": 0.75})
+        );
+
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        let root = jsonc::parse(&text).unwrap();
+        let astra_cost = root
+            .object_value()
+            .and_then(|o| o.object_value("provider"))
+            .and_then(|o| o.object_value("litellm"))
+            .and_then(|o| o.object_value("models"))
+            .and_then(|o| o.object_value("gpt-6-astra"))
+            .and_then(|o| o.object_value("cost"))
+            .unwrap();
+        astra_cost
+            .get("context_over_200k")
+            .unwrap()
+            .set_value(jsonc::to_input(&json!({"input": 0.3, "output": 0.9})));
+        std::fs::write(&config_path, jsonc::finish(&root, Some(&text))).unwrap();
+
+        install(&Config::default());
+        let value = read();
+        assert!(
+            models_path(&value, "gpt-6-luna")["cost"]
+                .get("context_over_200k")
+                .is_none()
+        );
+        assert_eq!(
+            models_path(&value, "gpt-6-astra")["cost"]["context_over_200k"],
+            json!({"input": 0.3, "output": 0.9}),
+            "a hand-written value is kept"
         );
     }
 }

@@ -522,7 +522,8 @@ mod tests {
                 cache_write: Some(0.25),
             },
         }];
-        let wide = render_with(160, vec![luna.clone()], Ok(None));        assert!(wide.contains("Cache write"), "{wide}");
+        let wide = render_with(160, vec![luna.clone()], Ok(None));
+        assert!(wide.contains("Cache write"), "{wide}");
         assert!(wide.contains("$0.12 → $0.25"));
         assert!(wide.contains("yellow applies once the prompt passes Long"));
 
