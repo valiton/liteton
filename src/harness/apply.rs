@@ -56,7 +56,7 @@ fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
             continue;
         }
         crate::config::ensure_private_dir(backup_dir)?;
-        let dest = backup_dir.join(path.file_name().unwrap_or_default());
+        let dest = backup_path(backup_dir, path);
         match change {
             Change::File { .. } => {
                 fs::copy(path, &dest).with_context(|| format!("backing up {}", path.display()))?;
@@ -66,6 +66,28 @@ fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
         done.push(path);
     }
     Ok(())
+}
+
+/// Files with the same name (one `chatLanguageModels.json` per VSCode profile) get their
+/// parent folder's name as a prefix, then a counter.
+fn backup_path(backup_dir: &Path, path: &Path) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let dest = backup_dir.join(name.as_ref());
+    if !dest.exists() {
+        return dest;
+    }
+    let parent = path
+        .parent()
+        .and_then(Path::file_name)
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    (1..)
+        .map(|n| match n {
+            1 => backup_dir.join(format!("{parent}-{name}")),
+            n => backup_dir.join(format!("{parent}-{n}-{name}")),
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused backup name")
 }
 
 /// Writes next to the target and renames, so a crash CAN'T leave a half-written config.

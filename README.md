@@ -27,8 +27,8 @@ This installs the `liteton` binary into `~/.cargo/bin`.
 ## Quick start
 
 ```sh
-liteton login      # save the LiteLLM URL and API key
-liteton install    # choose harnesses and models, preview, apply
+liteton login      # save the LiteLLM URL and API key, then continue into the install
+liteton install    # choose harnesses and models, preview, apply (any time later)
 liteton            # open the dashboard
 ```
 
@@ -37,7 +37,7 @@ liteton            # open the dashboard
 | Command | Description |
 |---|---|
 | `liteton` / `liteton dashboard` | Full-screen dashboard: budget, models with prices and limits, harness status. |
-| `liteton login` | Save the LiteLLM base URL and API key. The key is checked against the proxy first. |
+| `liteton login` | Save the LiteLLM base URL and API key. The key is checked against the proxy first, then liteton offers to run `install`. |
 | `liteton logout` | Remove the saved base URL and API key. |
 | `liteton install` | Configure harnesses to use LiteLLM models. |
 | `liteton uninstall` | Remove what liteton added to harness configs. |
@@ -53,6 +53,8 @@ liteton login --base-url https://litellm.example.com
 ```
 
 liteton asks for the API key in a hidden prompt. You can also pass it with `--api-key` or `LITETON_API_KEY`, but the prompt keeps it out of your shell history. A trailing `/v1` in the URL is removed.
+
+After saving, liteton asks "Configure harnesses now?" and continues straight into `install`. When it isn't running in a terminal (scripts, pipes), it only saves.
 
 ### `install`
 
@@ -111,7 +113,8 @@ liteton reads the models your key may use from `/v1/models`. It gets context win
 
 ### VSCode
 
-- Writes the `litellm` entry to `~/Library/Application Support/Code/User/chatLanguageModels.json`. Comments, formatting and your other entries are kept. If a `litellm` entry already exists, liteton merges into it and reuses its secret.
+- Writes the `litellm` entry to every VSCode profile's `chatLanguageModels.json`: `~/Library/Application Support/Code/User/chatLanguageModels.json` for the Default profile, and `…/Code/User/profiles/<id>/chatLanguageModels.json` for each other profile. The profile list comes from VSCode's `User/globalStorage/storage.json`. Profiles set to use the Default profile's language models are skipped, because VSCode reads the Default file for them.
+- Existing files are merged: comments, formatting and your other entries are kept. If a `litellm` entry already exists, liteton merges into it and reuses its secret. Profiles without the file get one, and all new entries share one secret.
 - Stores the API key in VSCode's secret storage (`state.vscdb`), encrypted the same way VSCode does it, with the "Code Safe Storage" password from the Keychain.
 - Open VSCode once before installing, so that `state.vscdb` exists.
 

@@ -179,13 +179,15 @@ pub fn binary_on_path(name: &str) -> bool {
 /// Ids liteton created earlier but that are no longer selected.
 pub fn deselected<'a>(record: Option<&'a HarnessRecord>, models: &[ModelSpec]) -> Vec<&'a String> {
     record
-        .map(|r| {
-            r.added_models
-                .iter()
-                .filter(|id| !models.iter().any(|m| &m.id == *id))
-                .collect()
-        })
+        .map(|r| deselected_ids(&r.added_models, models))
         .unwrap_or_default()
+}
+
+pub fn deselected_ids<'a>(added: &'a [String], models: &[ModelSpec]) -> Vec<&'a String> {
+    added
+        .iter()
+        .filter(|id| !models.iter().any(|m| &m.id == *id))
+        .collect()
 }
 
 /// Combines the previous record with this run: keeps earlier additions, adds new ones, drops deselected.
