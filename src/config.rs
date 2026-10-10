@@ -180,6 +180,9 @@ pub struct HarnessRecord {
     /// folder ("" = Default).
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub profiles: BTreeMap<String, ProfileRecord>,
+    /// VSCode: every secret liteton created, since profiles can point at different ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_secrets: Vec<String>,
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
@@ -211,6 +214,10 @@ impl HarnessRecord {
         self.added_models
             .iter()
             .chain(self.profiles.values().flat_map(|p| &p.added_models))
+    }
+
+    pub fn all_created_secrets(&self) -> impl Iterator<Item = &String> {
+        self.created_secret.iter().chain(&self.created_secrets)
     }
 }
 

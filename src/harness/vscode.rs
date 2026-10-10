@@ -2,7 +2,7 @@ use std::collections::BTreeSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use anyhow::{Result, anyhow, bail};
+use anyhow::{Context, Result, anyhow, bail};
 use jsonc_parser::cst::{CstArray, CstObject, CstRootNode};
 use serde_json::{Value, json};
 
@@ -59,8 +59,7 @@ impl VsCode {
 
     /// VSCode reads `chatLanguageModels.json` from each profile's folder, except for profiles
     /// with `useDefaultFlags.languageModels`, which read the Default profile's. The profile list
-    /// lives in `globalStorage/storage.json`; existing files in unlisted profile folders are
-    /// included too, in case that list can't be read.
+    /// lives in `globalStorage/storage.json`; if it can't be read, folders with the file are used.
     fn profiles(&self) -> Profiles {
         let mut profiles = Profiles {
             own: vec![Profile {
@@ -71,17 +70,15 @@ impl VsCode {
             shared: Vec::new(),
         };
         let mut shared_dirs = Vec::new();
-        let storage = read_optional(&self.user_dir.join("globalStorage/storage.json"))
+        let stored = read_optional(&self.user_dir.join("globalStorage/storage.json"))
             .ok()
             .flatten()
-            .and_then(|text| serde_json::from_str::<Value>(&text).ok());
-        let stored = storage
-            .as_ref()
-            .and_then(|v| v["userDataProfiles"].as_array())
-            .cloned()
-            .unwrap_or_default();
-        for profile in &stored {
+            .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+            .and_then(|v| v["userDataProfiles"].as_array().cloned());
+        let mut complete = stored.is_some();
+        for profile in stored.iter().flatten() {
             let Some(dir) = self.profile_dir(&profile["location"]) else {
+                complete = false;
                 continue;
             };
             let name = profile["name"]
@@ -98,6 +95,9 @@ impl VsCode {
                     dir,
                 });
             }
+        }
+        if complete {
+            return profiles;
         }
         for dir in self.profile_dirs_with_models() {
             if !profiles.own.iter().any(|p| p.dir == dir) && !shared_dirs.contains(&dir) {
@@ -198,12 +198,28 @@ impl Harness for VsCode {
             .map(HarnessRecord::profile_records)
             .unwrap_or_default();
 
+        let mut notes: Vec<String> = profiles_note(&profiles).into_iter().collect();
         let mut files = Vec::new();
+        let mut first_error = None;
         for profile in &profiles.own {
             let path = profile.models_path();
-            let before = read_optional(&path)?;
-            let root = jsonc::parse(before.as_deref().unwrap_or(""))?;
-            files.push((profile, path, before, root));
+            let read = read_optional(&path).and_then(|before| {
+                let root = jsonc::parse(before.as_deref().unwrap_or(""))
+                    .with_context(|| format!("parsing {}", path.display()))?;
+                Ok((before, root))
+            });
+            match read {
+                Ok((before, root)) => files.push((profile, path, before, root)),
+                Err(e) => {
+                    notes.push(format!("Skipped the {} profile: {e:#}", profile.name));
+                    first_error.get_or_insert(e);
+                }
+            }
+        }
+        if files.is_empty()
+            && let Some(e) = first_error
+        {
+            return Err(e);
         }
         // New entries reuse an existing secret (Default's first), so all profiles share one key.
         let new_secret = files
@@ -214,6 +230,7 @@ impl Harness for VsCode {
         let mut changes = Vec::new();
         let mut secrets = BTreeSet::new();
         let mut next_profiles = previous.clone();
+        next_profiles.retain(|key, _| self.dir_for(key).exists());
         for (profile, path, before, root) in files {
             let last = previous.get(&profile.key).cloned().unwrap_or_default();
             let (secret, next) = merge_profile(&root, ctx, &new_secret, &last)?;
@@ -234,11 +251,13 @@ impl Harness for VsCode {
         let db = StateDb::open_readonly(&db_path)?;
         let fingerprint = key_fingerprint(&ctx.creds.api_key);
         let key_changed = record.and_then(|r| r.key_fingerprint.as_ref()) != Some(&fingerprint);
-        let mut created_secret = None;
+        let mut created_secrets: Vec<String> = record
+            .map(|r| r.all_created_secrets().cloned().collect())
+            .unwrap_or_default();
         for secret in &secrets {
             let existed = db.get(&secret_key(secret))?.is_some();
-            if !existed && (created_secret.is_none() || *secret == new_secret) {
-                created_secret = Some(secret.clone());
+            if !existed && !created_secrets.contains(secret) {
+                created_secrets.push(secret.clone());
             }
             if !existed || key_changed {
                 changes.push(Change::DbItem {
@@ -258,16 +277,15 @@ impl Harness for VsCode {
         let mut next = record.cloned().unwrap_or_default();
         next.added_models.clear();
         next.created_provider = false;
+        next.created_secret = None;
+        next.created_secrets = created_secrets;
         next.profiles = next_profiles;
-        if next.created_secret.is_none() {
-            next.created_secret = created_secret;
-        }
         next.key_fingerprint = Some(fingerprint);
         Ok(Plan {
             harness: self.id(),
             changes,
             record: Some(next),
-            notes: profiles_note(&profiles).into_iter().collect(),
+            notes,
         })
     }
 
@@ -279,7 +297,7 @@ impl Harness for VsCode {
                 changes.push(change);
             }
         }
-        if let Some(secret) = &record.created_secret {
+        for secret in record.all_created_secrets() {
             changes.push(Change::DbItem {
                 app: ElectronApp::VSCode,
                 db: self.state_db(),
@@ -575,6 +593,36 @@ mod tests {
         jsonc::read_value(&std::fs::read_to_string(path).unwrap()).unwrap()
     }
 
+    fn written(plan: &Plan) -> Vec<PathBuf> {
+        plan.changes
+            .iter()
+            .filter(|c| matches!(c, Change::File { .. }))
+            .map(|c| c.path().to_path_buf())
+            .collect()
+    }
+
+    fn deleted_secrets(plan: &Plan) -> Vec<String> {
+        plan.changes
+            .iter()
+            .filter_map(|c| match c {
+                Change::DbItem {
+                    key,
+                    value: DbValue::Delete,
+                    ..
+                } => Some(key.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn write_profiles(user: &Path, profiles: Value) {
+        std::fs::write(
+            user.join("globalStorage/storage.json"),
+            json!({"userDataProfiles": profiles}).to_string(),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn merges_into_existing_entry_and_reuses_secret() {
         let dir = tempfile::tempdir().unwrap();
@@ -632,7 +680,7 @@ mod tests {
         let default = &record.profiles[""];
         assert_eq!(default.added_models, vec!["azure/gpt-5.4-nano".to_string()]);
         assert!(!default.created_provider);
-        assert_eq!(record.created_secret, None);
+        assert!(record.created_secrets.is_empty());
 
         // Same key on the next run: the secret is not rewritten, so VSCode needn't be closed.
         let again = install(&harness, &creds, &models, Some(&record));
@@ -663,7 +711,7 @@ mod tests {
         let plan = install(&harness, &creds(), &models, None);
         let record = plan.record.clone().unwrap();
         assert!(record.profiles[""].created_provider);
-        assert_eq!(record.created_secret.as_deref(), Some(DEFAULT_SECRET));
+        assert_eq!(record.created_secrets, [DEFAULT_SECRET]);
 
         // Apply only the file part; the secret needs the Keychain.
         crate::harness::apply::apply(&files_only(plan), &dir.path().join("backup"), None).unwrap();
@@ -716,14 +764,8 @@ mod tests {
             plan.notes,
             ["Profiles: Default, DSA, Work. Agents uses the Default profile's models."]
         );
-        let files: Vec<PathBuf> = plan
-            .changes
-            .iter()
-            .filter(|c| matches!(c, Change::File { .. }))
-            .map(|c| c.path().to_path_buf())
-            .collect();
         assert_eq!(
-            files,
+            written(&plan),
             [
                 user.join(MODELS_FILE),
                 user.join("profiles/-24b23f00").join(MODELS_FILE),
@@ -750,10 +792,12 @@ mod tests {
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
             .collect();
-        assert!(
-            backups.contains(&"502346-chatLanguageModels.json".to_string()),
-            "{backups:?}"
-        );
+        for name in [
+            "User-chatLanguageModels.json",
+            "502346-chatLanguageModels.json",
+        ] {
+            assert!(backups.contains(&name.to_string()), "{backups:?}");
+        }
 
         let dsa = read(&user.join("profiles/-24b23f00").join(MODELS_FILE));
         assert_eq!(dsa[0]["apiKey"], json!("${input:chat.lm.secret.1c807067}"));
@@ -795,20 +839,138 @@ mod tests {
 
         let harness = VsCode::new(&paths);
         let plan = install(&harness, &creds(), &[spec("m", false)], None);
-        let files: Vec<&Path> = plan
-            .changes
-            .iter()
-            .filter(|c| matches!(c, Change::File { .. }))
-            .map(|c| c.path())
-            .collect();
         assert_eq!(
-            files,
-            [
-                user.join(MODELS_FILE).as_path(),
-                work.join(MODELS_FILE).as_path()
-            ]
+            written(&plan),
+            [user.join(MODELS_FILE), work.join(MODELS_FILE)]
         );
         assert_eq!(plan.notes, ["Profiles: Default, 502346."]);
+    }
+
+    #[test]
+    fn walks_profile_folders_only_when_the_list_is_unusable() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let user = &paths.vscode_user_dir;
+        create_state_db(&user.join("globalStorage/state.vscdb"), &[]);
+        write_profiles(user, json!([{"location": "-24b23f00", "name": "DSA"}]));
+        let old = user.join("profiles/old");
+        std::fs::create_dir_all(&old).unwrap();
+        std::fs::write(old.join(MODELS_FILE), "[]").unwrap();
+        let harness = VsCode::new(&paths);
+        let dsa = user.join("profiles/-24b23f00").join(MODELS_FILE);
+
+        let plan = install(&harness, &creds(), &[spec("m", false)], None);
+        assert_eq!(written(&plan), [user.join(MODELS_FILE), dsa.clone()]);
+
+        write_profiles(
+            user,
+            json!([{"location": "-24b23f00", "name": "DSA"}, {"location": 42, "name": "New"}]),
+        );
+        let plan = install(&harness, &creds(), &[spec("m", false)], None);
+        assert_eq!(
+            written(&plan),
+            [user.join(MODELS_FILE), dsa, old.join(MODELS_FILE)]
+        );
+    }
+
+    #[test]
+    fn skips_profiles_it_cannot_parse() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let user = &paths.vscode_user_dir;
+        create_state_db(&user.join("globalStorage/state.vscdb"), &[]);
+        write_profiles(user, json!([{"location": "-24b23f00", "name": "DSA"}]));
+        let dsa = user.join("profiles/-24b23f00");
+        std::fs::create_dir_all(&dsa).unwrap();
+        std::fs::write(dsa.join(MODELS_FILE), "[{").unwrap();
+        let harness = VsCode::new(&paths);
+
+        let plan = install(&harness, &creds(), &[spec("m", false)], None);
+        assert_eq!(written(&plan), [user.join(MODELS_FILE)]);
+        assert!(
+            plan.notes
+                .iter()
+                .any(|n| n.starts_with("Skipped the DSA profile: parsing ")),
+            "{:?}",
+            plan.notes
+        );
+
+        std::fs::write(user.join(MODELS_FILE), "[{").unwrap();
+        let err = harness
+            .plan_install(
+                &InstallCtx {
+                    creds: &creds(),
+                    models: &[spec("m", false)],
+                    config: &Config::default(),
+                },
+                None,
+            )
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("parsing"), "{err:#}");
+    }
+
+    #[test]
+    fn tracks_every_secret_it_creates() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        let user = &paths.vscode_user_dir;
+        create_state_db(&user.join("globalStorage/state.vscdb"), &[]);
+        write_profiles(user, json!([{"location": "502346", "name": "Work"}]));
+        let entry = |secret: &str| {
+            json!([{"name": "litellm", "vendor": "customendpoint",
+                    "apiKey": format!("${{input:{secret}}}"), "models": []}])
+            .to_string()
+        };
+        std::fs::write(user.join(MODELS_FILE), entry("chat.lm.secret.a")).unwrap();
+        let work = user.join("profiles/502346");
+        std::fs::create_dir_all(&work).unwrap();
+        std::fs::write(work.join(MODELS_FILE), entry("chat.lm.secret.b")).unwrap();
+
+        let harness = VsCode::new(&paths);
+        let record = install(&harness, &creds(), &[spec("m", false)], None)
+            .record
+            .unwrap();
+        assert_eq!(
+            record.created_secrets,
+            ["chat.lm.secret.a", "chat.lm.secret.b"]
+        );
+        assert_eq!(
+            deleted_secrets(&harness.plan_uninstall(&record).unwrap()),
+            [
+                secret_key("chat.lm.secret.a"),
+                secret_key("chat.lm.secret.b")
+            ]
+        );
+    }
+
+    #[test]
+    fn forgets_deleted_profiles() {
+        let dir = tempfile::tempdir().unwrap();
+        let paths = paths_in(dir.path());
+        create_state_db(
+            &paths.vscode_user_dir.join("globalStorage/state.vscdb"),
+            &[],
+        );
+        let old = HarnessRecord {
+            profiles: [(
+                "profiles/gone".to_string(),
+                ProfileRecord {
+                    added_models: vec!["x".into()],
+                    created_provider: true,
+                },
+            )]
+            .into(),
+            ..HarnessRecord::default()
+        };
+        let next = install(
+            &VsCode::new(&paths),
+            &creds(),
+            &[spec("m", false)],
+            Some(&old),
+        )
+        .record
+        .unwrap();
+        assert_eq!(next.profiles.keys().collect::<Vec<_>>(), [""]);
     }
 
     #[test]
@@ -826,6 +988,7 @@ mod tests {
         let old = HarnessRecord {
             added_models: vec!["a".into()],
             created_provider: true,
+            created_secret: Some(DEFAULT_SECRET.into()),
             ..HarnessRecord::default()
         };
         let harness = VsCode::new(&paths);
@@ -838,11 +1001,14 @@ mod tests {
             jsonc::read_value(after).unwrap()[0]["models"],
             json!([{"id": "b"}])
         );
+        assert_eq!(deleted_secrets(&uninstall), [secret_key(DEFAULT_SECRET)]);
 
         let next = install(&harness, &creds(), &[spec("b", false)], Some(&old))
             .record
             .unwrap();
         assert!(next.added_models.is_empty());
+        assert_eq!(next.created_secret, None);
+        assert_eq!(next.created_secrets, [DEFAULT_SECRET]);
         assert_eq!(
             next.profiles[""],
             ProfileRecord {

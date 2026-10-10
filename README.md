@@ -113,7 +113,7 @@ liteton reads the models your key may use from `/v1/models`. It gets context win
 
 ### VSCode
 
-- Writes the `litellm` entry to every VSCode profile's `chatLanguageModels.json`: `~/Library/Application Support/Code/User/chatLanguageModels.json` for the Default profile, and `…/Code/User/profiles/<id>/chatLanguageModels.json` for each other profile. The profile list comes from VSCode's `User/globalStorage/storage.json`. Profiles set to use the Default profile's language models are skipped, because VSCode reads the Default file for them.
+- Writes the `litellm` entry to every VSCode profile's `chatLanguageModels.json`: `~/Library/Application Support/Code/User/chatLanguageModels.json` for the Default profile, and `…/Code/User/profiles/<id>/chatLanguageModels.json` for each other profile. The profile list comes from VSCode's `User/globalStorage/storage.json`. Profiles set to use the Default profile's language models are skipped, because VSCode reads the Default file for them. A profile whose file can't be parsed is skipped, and the preview names it.
 - Existing files are merged: comments, formatting and your other entries are kept. If a `litellm` entry already exists, liteton merges into it and reuses its secret. Profiles without the file get one, and all new entries share one secret.
 - Stores the API key in VSCode's secret storage (`state.vscdb`), encrypted the same way VSCode does it, with the "Code Safe Storage" password from the Keychain.
 - Open VSCode once before installing, so that `state.vscdb` exists.
