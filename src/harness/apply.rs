@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -49,6 +49,7 @@ pub fn apply(plan: &Plan, backup_dir: &Path, secrets: Option<&SecretWriter>) -> 
 }
 
 fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
+    let paths: BTreeSet<&Path> = plan.changes.iter().map(Change::path).collect();
     let mut done: Vec<&Path> = Vec::new();
     for change in &plan.changes {
         let path = change.path();
@@ -56,7 +57,12 @@ fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
             continue;
         }
         crate::config::ensure_private_dir(backup_dir)?;
-        let dest = backup_dir.join(path.file_name().unwrap_or_default());
+        let shared_name = paths
+            .iter()
+            .filter(|p| p.file_name() == path.file_name())
+            .count()
+            > 1;
+        let dest = backup_path(backup_dir, path, shared_name);
         match change {
             Change::File { .. } => {
                 fs::copy(path, &dest).with_context(|| format!("backing up {}", path.display()))?;
@@ -66,6 +72,25 @@ fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
         done.push(path);
     }
     Ok(())
+}
+
+/// Files that share a name (one `chatLanguageModels.json` per VSCode profile) get their parent
+/// folder's name as a prefix.
+fn backup_path(backup_dir: &Path, path: &Path, shared_name: bool) -> PathBuf {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let prefix = path
+        .parent()
+        .and_then(Path::file_name)
+        .filter(|_| shared_name)
+        .map(|p| format!("{}-", p.to_string_lossy()))
+        .unwrap_or_default();
+    (1..)
+        .map(|n| match n {
+            1 => backup_dir.join(format!("{prefix}{name}")),
+            n => backup_dir.join(format!("{prefix}{n}-{name}")),
+        })
+        .find(|candidate| !candidate.exists())
+        .expect("an unused backup name")
 }
 
 /// Writes next to the target and renames, so a crash CAN'T leave a half-written config.

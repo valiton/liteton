@@ -1,18 +1,42 @@
 use anyhow::{Result, bail};
 use tokio::runtime::Runtime;
 
+use crate::cli::InstallArgs;
 use crate::config::{self, Config, Credentials, normalize_base_url};
 use crate::litellm::Client;
 
 pub fn login(rt: &Runtime, base_url: Option<String>, api_key: Option<String>) -> Result<()> {
+    use std::io::IsTerminal;
     cliclack::intro(" liteton login ")?;
     let mut config = Config::load()?;
-    prompt_and_save(rt, &mut config, base_url, api_key)?;
-    cliclack::outro(format!(
+    let creds = prompt_and_save(rt, &mut config, base_url, api_key)?;
+    let saved = format!(
         "Saved. Base URL in {}, API key in the macOS Keychain.",
-        config::config_dir().join("config.toml").display()
-    ))?;
+        config::config_file().display()
+    );
+    if !offer_install(
+        std::io::stdin().is_terminal(),
+        std::io::stdout().is_terminal(),
+    ) {
+        cliclack::outro(format!(
+            "{saved}\nRun `liteton install` to configure your harnesses."
+        ))?;
+        return Ok(());
+    }
+    cliclack::log::success(saved)?;
+    if cliclack::confirm("Configure harnesses now?")
+        .initial_value(true)
+        .interact()?
+    {
+        return super::install::install_with(rt, InstallArgs::default(), &mut config, creds);
+    }
+    cliclack::outro("Run `liteton install` any time to configure your harnesses.")?;
     Ok(())
+}
+
+/// The install question needs someone to answer it, so scripts and pipes skip it.
+fn offer_install(stdin_is_terminal: bool, stdout_is_terminal: bool) -> bool {
+    stdin_is_terminal && stdout_is_terminal
 }
 
 pub fn logout() -> Result<()> {
@@ -86,4 +110,16 @@ fn prompt_and_save(
     }
     config::save_credentials(config, &creds)?;
     Ok(creds)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn offers_the_install_only_in_a_terminal() {
+        assert!(offer_install(true, true));
+        assert!(!offer_install(false, true), "piped input");
+        assert!(!offer_install(true, false), "redirected output");
+    }
 }

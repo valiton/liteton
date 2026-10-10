@@ -176,6 +176,49 @@ pub struct HarnessRecord {
     pub previous: BTreeMap<String, serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_fingerprint: Option<String>,
+    /// VSCode: what liteton added per profile, keyed by the profile folder relative to the User
+    /// folder ("" = Default).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub profiles: BTreeMap<String, ProfileRecord>,
+    /// VSCode: every secret liteton created, since profiles can point at different ones.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub created_secrets: Vec<String>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ProfileRecord {
+    #[serde(default)]
+    pub added_models: Vec<String>,
+    #[serde(default)]
+    pub created_provider: bool,
+}
+
+impl HarnessRecord {
+    /// Per-profile records. A VSCode record from before profiles counts as the Default profile's.
+    pub fn profile_records(&self) -> BTreeMap<String, ProfileRecord> {
+        let mut profiles = self.profiles.clone();
+        if !self.added_models.is_empty() || self.created_provider {
+            let default = profiles.entry(String::new()).or_default();
+            for id in &self.added_models {
+                if !default.added_models.contains(id) {
+                    default.added_models.push(id.clone());
+                }
+            }
+            default.created_provider |= self.created_provider;
+        }
+        profiles
+    }
+
+    /// Every model liteton added, across profiles.
+    pub fn all_added_models(&self) -> impl Iterator<Item = &String> {
+        self.added_models
+            .iter()
+            .chain(self.profiles.values().flat_map(|p| &p.added_models))
+    }
+
+    pub fn all_created_secrets(&self) -> impl Iterator<Item = &String> {
+        self.created_secret.iter().chain(&self.created_secrets)
+    }
 }
 
 pub fn key_fingerprint(api_key: &str) -> String {

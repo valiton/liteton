@@ -57,7 +57,7 @@ pub enum Command {
     Dashboard,
 }
 
-#[derive(Debug, clap::Args)]
+#[derive(Debug, Default, clap::Args)]
 pub struct InstallArgs {
     /// Harness(es) to configure. Prompts when omitted.
     #[arg(long, value_enum, num_args = 1..)]

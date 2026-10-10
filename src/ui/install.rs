@@ -6,17 +6,26 @@ use tokio::runtime::Runtime;
 
 use super::{change_preview, format_cost, format_tokens};
 use crate::cli::InstallArgs;
-use crate::config::{self, Config, InstallState};
+use crate::config::{self, Config, Credentials, InstallState};
 use crate::harness::{self, Harness, HarnessId, HarnessPaths, InstallCtx, Plan, cursor, opencode};
 use crate::litellm::{Client, ModelSpec};
 use crate::vscdb::{SecretWriter, StateDb};
 
 pub fn install(rt: &Runtime, args: InstallArgs) -> Result<()> {
     cliclack::intro(" liteton install ")?;
-    let paths = HarnessPaths::default();
     let mut config = Config::load()?;
     let creds = super::prompts::ensure_credentials(rt, &mut config, args.yes)?;
+    install_with(rt, args, &mut config, creds)
+}
 
+/// The install flow once credentials are known; also continues a `liteton login`.
+pub fn install_with(
+    rt: &Runtime,
+    args: InstallArgs,
+    config: &mut Config,
+    creds: Credentials,
+) -> Result<()> {
+    let paths = HarnessPaths::default();
     let spinner = cliclack::spinner();
     spinner.start("Fetching models from LiteLLM");
     let models = match rt.block_on(Client::new(&creds)?.models()) {
@@ -51,13 +60,13 @@ pub fn install(rt: &Runtime, args: InstallArgs) -> Result<()> {
         selected.retain(|id| *id != HarnessId::Cursor);
     }
     if selected.contains(&HarnessId::Opencode) {
-        decide_opencode_long_context(&mut config, &chosen, args.yes)?;
+        decide_opencode_long_context(config, &chosen, args.yes)?;
     }
 
     let ctx = InstallCtx {
         creds: &creds,
         models: &chosen,
-        config: &config,
+        config,
     };
     let mut plans = Vec::new();
     for id in &selected {
@@ -210,7 +219,7 @@ fn select_models(
     let previous: BTreeSet<&String> = state
         .harnesses
         .values()
-        .flat_map(|r| &r.added_models)
+        .flat_map(|r| r.all_added_models())
         .collect();
     let initial: Vec<String> = if previous.is_empty() {
         models.iter().map(|m| m.id.clone()).collect()
