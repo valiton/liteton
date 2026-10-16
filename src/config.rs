@@ -5,10 +5,13 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+use crate::litellm::ModelSpec;
+
 const KEYCHAIN_SERVICE: &str = "liteton";
 const KEYCHAIN_ACCOUNT: &str = "api-key";
 
-pub const DEFAULT_REASONING_EFFORTS: &[&str] = &["none", "low", "medium", "high", "xhigh"];
+/// Used when neither config.toml nor LiteLLM names a model's effort levels.
+pub const DEFAULT_REASONING_EFFORTS: &[&str] = &["low", "medium", "high"];
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Config {
@@ -42,8 +45,12 @@ impl Config {
             .with_context(|| format!("writing {}", path.display()))
     }
 
-    pub fn reasoning_efforts_for(&self, model_id: &str) -> Vec<String> {
-        if let Some(levels) = self.model_reasoning_efforts.get(model_id) {
+    /// config.toml's per-model list, then what LiteLLM reports, then config.toml's global list.
+    pub fn reasoning_efforts_for(&self, model: &ModelSpec) -> Vec<String> {
+        if let Some(levels) = self.model_reasoning_efforts.get(&model.id) {
+            return levels.clone();
+        }
+        if let Some(levels) = &model.reasoning_efforts {
             return levels.clone();
         }
         match &self.reasoning_efforts {
@@ -267,13 +274,18 @@ mod tests {
     #[test]
     fn reasoning_overrides() {
         let mut config = Config::default();
+        let mut model = ModelSpec::bare("m");
         assert_eq!(
-            config.reasoning_efforts_for("m").len(),
-            DEFAULT_REASONING_EFFORTS.len()
+            config.reasoning_efforts_for(&model),
+            DEFAULT_REASONING_EFFORTS
         );
+        config.reasoning_efforts = Some(vec!["high".into()]);
+        assert_eq!(config.reasoning_efforts_for(&model), ["high"]);
+        model.reasoning_efforts = Some(vec!["none".into(), "max".into()]);
+        assert_eq!(config.reasoning_efforts_for(&model), ["none", "max"]);
         config
             .model_reasoning_efforts
             .insert("m".into(), vec!["low".into()]);
-        assert_eq!(config.reasoning_efforts_for("m"), vec!["low".to_string()]);
+        assert_eq!(config.reasoning_efforts_for(&model), ["low"]);
     }
 }

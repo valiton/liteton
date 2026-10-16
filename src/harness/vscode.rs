@@ -178,6 +178,10 @@ impl Harness for VsCode {
         self.user_dir.exists() || binary_on_path("code")
     }
 
+    fn hint(&self) -> &'static str {
+        "VSCode: open the chat model picker; the models are listed under \"litellm\"."
+    }
+
     fn is_installed(&self) -> bool {
         self.profiles()
             .own
@@ -237,15 +241,7 @@ impl Harness for VsCode {
             secrets.insert(secret);
             next_profiles.insert(profile.key.clone(), next);
             let after = jsonc::finish(&root, before.as_deref());
-            if before.as_deref() != Some(after.as_str()) {
-                changes.push(Change::File {
-                    path,
-                    before,
-                    after,
-                    private: false,
-                    summary: vec![],
-                });
-            }
+            changes.extend(Change::file(path, before, after));
         }
 
         let db = StateDb::open_readonly(&db_path)?;
@@ -269,7 +265,7 @@ impl Harness for VsCode {
                         "{} the API key (encrypted with \"Code Safe Storage\")",
                         if existed { "replace" } else { "store" }
                     )],
-                    value: DbValue::Secret(ctx.creds.api_key.clone()),
+                    value: DbValue::Secret(ctx.creds.api_key.clone().into()),
                 });
             }
         }
@@ -421,13 +417,7 @@ fn remove_from(path: &Path, profile: &ProfileRecord) -> Result<Option<Change>> {
         }
     }
     let after = jsonc::finish(&root, Some(&before));
-    Ok((after != before).then(|| Change::File {
-        path: path.to_path_buf(),
-        before: Some(before),
-        after,
-        private: false,
-        summary: vec![],
-    }))
+    Ok(Change::file(path.to_path_buf(), Some(before), after))
 }
 
 /// "Profiles: Default, DSA. Agents uses the Default profile's models." Only when there are
@@ -517,7 +507,7 @@ fn model_entry(model: &ModelSpec, base_url: &str, config: &Config) -> Value {
     if model.reasoning {
         obj.insert(
             "supportsReasoningEffort".into(),
-            json!(config.reasoning_efforts_for(&model.id)),
+            json!(config.reasoning_efforts_for(model)),
         );
     }
     if let Some(context) = model.context_window {
@@ -597,7 +587,7 @@ mod tests {
         plan.changes
             .iter()
             .filter(|c| matches!(c, Change::File { .. }))
-            .map(|c| c.path().to_path_buf())
+            .filter_map(|c| c.path().map(Path::to_path_buf))
             .collect()
     }
 
@@ -664,7 +654,7 @@ mod tests {
         assert_eq!(entry["models"][0]["url"], json!("https://llm.example.com"));
         assert_eq!(
             entry["models"][0]["supportsReasoningEffort"],
-            json!(["none", "low", "medium", "high", "xhigh"])
+            json!(["low", "medium", "high"])
         );
         assert_eq!(entry["models"][1]["id"], json!("azure/gpt-5.4-nano"));
         assert_eq!(entry["models"][1]["contextWindow"], json!(400000));
@@ -777,7 +767,7 @@ mod tests {
             .iter()
             .filter_map(|c| match c {
                 Change::DbItem { key, .. } => Some(key),
-                Change::File { .. } => None,
+                Change::File { .. } | Change::Command { .. } => None,
             })
             .collect();
         assert_eq!(

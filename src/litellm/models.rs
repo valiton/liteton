@@ -17,6 +17,8 @@ pub struct ModelSpec {
     pub tool_calling: bool,
     pub vision: bool,
     pub reasoning: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Serialize)]
@@ -38,6 +40,19 @@ impl Pricing {
     fn is_empty(&self) -> bool {
         *self == Self::default()
     }
+
+    pub fn is_priced(&self) -> bool {
+        self.input.is_some() && self.output.is_some()
+    }
+
+    pub fn or(&self, fallback: &Pricing) -> Pricing {
+        Pricing {
+            input: self.input.or(fallback.input),
+            output: self.output.or(fallback.output),
+            cache_read: self.cache_read.or(fallback.cache_read),
+            cache_write: self.cache_write.or(fallback.cache_write),
+        }
+    }
 }
 
 impl ModelSpec {
@@ -53,6 +68,7 @@ impl ModelSpec {
             tool_calling: true,
             vision: false,
             reasoning: false,
+            reasoning_efforts: None,
         }
     }
 
@@ -119,7 +135,71 @@ fn spec_from_info(id: &str, info: &Value) -> ModelSpec {
         tool_calling: flag("supports_function_calling") || params.contains(&"tools"),
         vision: flag("supports_vision"),
         reasoning: flag("supports_reasoning") || params.contains(&"reasoning_effort"),
+        reasoning_efforts: reasoning_efforts(info)
+            .map(|levels| without_unsupported(levels, &[id, info["key"].as_str().unwrap_or(id)])),
     }
+}
+
+/// Levels LiteLLM's catalog wrongly reports. Its `azure/` entries claim `none` for these, and
+/// OpenAI rejects it with a 400.
+const UNSUPPORTED_EFFORTS: &[(&str, &[&str])] =
+    &[("gpt-6.1-sol", &["none"]), ("gpt-6-astra", &["none"])];
+
+/// `names` are the proxy alias and the deployment it routes to (`model_info.key`), since an
+/// alias can hide which model it is.
+fn without_unsupported(levels: Vec<String>, names: &[&str]) -> Vec<String> {
+    let unsupported: Vec<&str> = UNSUPPORTED_EFFORTS
+        .iter()
+        .filter(|(model, _)| names.iter().any(|name| base_model(name) == *model))
+        .flat_map(|(_, levels)| levels.iter().copied())
+        .collect();
+    levels
+        .into_iter()
+        .filter(|level| !unsupported.contains(&level.as_str()))
+        .collect()
+}
+fn base_model(name: &str) -> &str {
+    let mut base = name.rsplit('/').next().unwrap_or(name);
+    while let Some(rest) = ["global.", "us.", "eu.", "openai."]
+        .iter()
+        .find_map(|prefix| base.strip_prefix(prefix))
+    {
+        base = rest;
+    }
+    base
+}
+
+fn reasoning_efforts(info: &Value) -> Option<Vec<String>> {
+    if let Some(levels) = info["reasoning_effort_levels"].as_array() {
+        return Some(
+            levels
+                .iter()
+                .filter_map(Value::as_str)
+                .map(str::to_string)
+                .collect(),
+        );
+    }
+    let support = |level: &str| info[format!("supports_{level}_reasoning_effort")].as_bool();
+    let flags = ["none", "minimal", "low", "xhigh", "max"];
+    if flags.iter().all(|level| support(level).is_none()) {
+        return None;
+    }
+    let levels = [
+        ("none", support("none") == Some(true)),
+        ("minimal", support("minimal") == Some(true)),
+        ("low", support("low") != Some(false)),
+        ("medium", true),
+        ("high", true),
+        ("xhigh", support("xhigh") == Some(true)),
+        ("max", support("max") == Some(true)),
+    ];
+    Some(
+        levels
+            .into_iter()
+            .filter(|(_, on)| *on)
+            .map(|(level, _)| level.to_string())
+            .collect(),
+    )
 }
 
 const INPUT: &str = "input_cost_per_token";
@@ -295,6 +375,73 @@ mod tests {
         let fable = &specs[1];
         assert_eq!(fable.pricing, pricing(10.0, 50.0, 0.25, 12.5));
         assert!(fable.long_context().is_none());
+    }
+
+    #[test]
+    fn reads_reasoning_efforts() {
+        let efforts = |info: Value| spec_from_info("m", &info).reasoning_efforts;
+        assert_eq!(efforts(json!({"supports_reasoning": true})), None);
+        assert_eq!(
+            efforts(json!({
+                "supports_none_reasoning_effort": true,
+                "supports_minimal_reasoning_effort": false,
+                "supports_xhigh_reasoning_effort": false,
+            })),
+            Some(vec![
+                "none".into(),
+                "low".into(),
+                "medium".into(),
+                "high".into()
+            ])
+        );
+        assert_eq!(
+            efforts(json!({
+                "supports_none_reasoning_effort": null,
+                "supports_xhigh_reasoning_effort": true,
+                "supports_max_reasoning_effort": true,
+            })),
+            Some(vec![
+                "low".into(),
+                "medium".into(),
+                "high".into(),
+                "xhigh".into(),
+                "max".into()
+            ])
+        );
+        assert_eq!(
+            efforts(json!({
+                "reasoning_effort_levels": ["low", "high", "max"],
+                "supports_none_reasoning_effort": true,
+            })),
+            Some(vec!["low".into(), "high".into(), "max".into()])
+        );
+        assert_eq!(
+            efforts(json!({"reasoning_effort_levels": []})),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn drops_efforts_litellm_gets_wrong() {
+        let azure = json!({
+            "key": "azure/gpt-6.1-sol",
+            "supports_none_reasoning_effort": true,
+            "supports_max_reasoning_effort": true,
+        });
+        let levels = ["low", "medium", "high", "max"].map(String::from).to_vec();
+        assert_eq!(
+            spec_from_info("sol", &azure).reasoning_efforts,
+            Some(levels)
+        );
+        let luna = json!({"key": "azure/gpt-6-luna", "supports_none_reasoning_effort": true});
+        assert_eq!(
+            spec_from_info("gpt-6-luna", &luna)
+                .reasoning_efforts
+                .unwrap()[0],
+            "none"
+        );
+        assert_eq!(base_model("global.openai.gpt-6-astra"), "gpt-6-astra");
+        assert_eq!(base_model("azure/eu/gpt-6.1-sol"), "gpt-6.1-sol");
     }
 
     #[test]

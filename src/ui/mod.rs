@@ -135,6 +135,13 @@ pub fn change_preview(change: &Change) -> String {
             }
             out
         }
+        Change::Command { label, summary, .. } => {
+            let mut out = format!("{}\n", label.clone().bold());
+            for line in summary {
+                out.push_str(&format!("{}{line}\n", " ~ ".yellow()));
+            }
+            out
+        }
     }
 }
 

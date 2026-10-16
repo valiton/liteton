@@ -77,7 +77,12 @@ fn table(models: &[ModelSpec]) -> Table {
             price(|p| p.cache_write),
             mark(model.tool_calling),
             mark(model.vision),
-            mark(model.reasoning),
+            match &model.reasoning_efforts {
+                Some(levels) if model.reasoning && !levels.is_empty() => {
+                    Cell::new(levels.join(" ").green())
+                }
+                _ => mark(model.reasoning),
+            },
         ]);
     }
     table

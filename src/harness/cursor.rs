@@ -79,6 +79,10 @@ impl Harness for Cursor {
         self.user_dir.exists() || binary_on_path("cursor")
     }
 
+    fn hint(&self) -> &'static str {
+        "Cursor: the models are enabled in Settings > Models."
+    }
+
     fn is_installed(&self) -> bool {
         self.read_settings()
             .is_ok_and(|(_, v)| v[USE_KEY] == json!(true) && v[BASE_URL].is_string())
@@ -156,7 +160,7 @@ impl Harness for Cursor {
                     "{} the API key (encrypted with \"Cursor Safe Storage\")",
                     if secret_existed { "replace" } else { "store" }
                 )],
-                value: DbValue::Secret(ctx.creds.api_key.clone()),
+                value: DbValue::Secret(ctx.creds.api_key.clone().into()),
             });
         }
 

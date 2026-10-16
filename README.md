@@ -8,6 +8,7 @@ Run `liteton install`, pick your tools and models, and liteton adds a `litellm` 
 |---|---|
 | **VSCode** (Copilot Chat) | A `litellm` custom endpoint in `chatLanguageModels.json`. The API key goes into VSCode's encrypted secret storage. |
 | **opencode** | A `litellm` provider in `opencode.jsonc`/`opencode.json`. The API key goes into opencode's `auth.json`. |
+| **opencode 2** | A `litellm` entry under `providers` in the same file, in the v2 format. The API key is stored with `opencode auth import`. |
 | **Cursor** (experimental) | The OpenAI base URL override, the enabled models, and the OpenAI API key in Cursor's settings. |
 
 > **macOS only.** liteton uses the macOS Keychain and the macOS paths of VSCode and Cursor.
@@ -68,7 +69,7 @@ liteton install --yes                             # no prompts
 
 | Option | Description |
 |---|---|
-| `--harness <vscode\|opencode\|cursor>...` | Harnesses to configure. Without it, liteton asks and preselects the ones it detects. Cursor is never preselected. |
+| `--harness <vscode\|opencode\|opencode2\|cursor>...` | Harnesses to configure. Without it, liteton asks and preselects the ones it detects. Cursor is never preselected. |
 | `--models <id>...` | Model ids to install. Without it, liteton asks. On later runs, the models you installed before are preselected. |
 | `--dry-run` | Show the changes without writing anything. |
 | `-y`, `--yes` | Skip confirmation prompts. Cursor warnings are still printed. |
@@ -124,6 +125,13 @@ liteton reads the models your key may use from `/v1/models`. It gets context win
 - Adds the API key to `~/.local/share/opencode/auth.json` and keeps all other entries. The file is written with mode `0600`.
 - `XDG_CONFIG_HOME` and `XDG_DATA_HOME` are respected.
 
+### opencode 2
+
+- opencode 1 and 2 read the same config file. opencode 2 gets `providers.litellm` (v2 format: `capabilities`, `cost.cache`, `variants` as a list), and opencode 1 ignores that key. If you use both, select both: each version keeps its own entry.
+- Long-context prices are written exactly. opencode 2's `cost` takes a list of context tiers, so every `above_<N>k_tokens` price from LiteLLM becomes its own tier, e.g. above 100k or 272k. opencode 1 only has a slot at 200k.
+- opencode 2 reads `auth.json` only once, when it first starts. So liteton adds its own credential (`cred_liteton_litellm`) with `opencode auth import` and makes it the active LiteLLM credential. Your other credentials are kept, and `liteton uninstall` removes only that one with `opencode auth logout`. This needs opencode 2 as the `opencode` on your `PATH`.
+- If you installed with opencode 1 and then migrated your config, the first opencode 2 install takes over the opencode 1 record, so `uninstall` still removes the models liteton added.
+
 ### Cursor (experimental)
 
 Read the warnings that liteton prints before you continue:
@@ -172,7 +180,9 @@ With both set, liteton works without `liteton login`, e.g. in scripts.
 
 ### Reasoning effort levels
 
-For reasoning models, liteton offers the levels `none`, `low`, `medium`, `high` and `xhigh` (VSCode `supportsReasoningEffort`, opencode `variants`). You can change them in `~/.config/liteton/config.toml`, for all models or per model:
+For reasoning models, liteton writes the effort levels your proxy reports for each model (VSCode `supportsReasoningEffort`, opencode `variants`). It reads them from `/model/info`: `reasoning_effort_levels` when the model has it, otherwise `low`, `medium` and `high`, plus `none`, `minimal`, `xhigh` and `max` when the matching `supports_<level>_reasoning_effort` flag is true. liteton also corrects a few levels LiteLLM's catalog gets wrong: its `azure/` entries claim `none` for gpt-6.1-sol and gpt-6-astra, which OpenAI rejects. `liteton models` shows the result. Models the proxy reports nothing for get `low`, `medium` and `high`; older LiteLLM versions don't report these fields.
+
+You can override this in `~/.config/liteton/config.toml`. A per-model list wins over what the proxy reports, and the global list only applies to models the proxy reports nothing for:
 
 ```toml
 base_url = "https://litellm.example.com"

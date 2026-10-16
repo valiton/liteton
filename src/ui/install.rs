@@ -1,6 +1,8 @@
 use std::collections::BTreeSet;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Result, bail};
+use clap::ValueEnum;
 use crossterm::style::Stylize;
 use tokio::runtime::Runtime;
 
@@ -68,10 +70,19 @@ pub fn install_with(
         models: &chosen,
         config,
     };
+    let recorded = state.clone();
+    let plan = |id: HarnessId| {
+        let harness = harness::get(&paths, id);
+        let record = recorded
+            .harnesses
+            .get(id.key())
+            .cloned()
+            .or_else(|| harness.inherited_record(&recorded));
+        harness.plan_install(&ctx, record.as_ref())
+    };
     let mut plans = Vec::new();
     for id in &selected {
-        let harness = harness::get(&paths, *id);
-        match harness.plan_install(&ctx, state.harnesses.get(id.key())) {
+        match plan(*id) {
             Ok(plan) => plans.push(plan),
             Err(e) => cliclack::log::error(format!("{}: {e:#}", id.display_name()))?,
         }
@@ -80,22 +91,15 @@ pub fn install_with(
         cliclack::outro_cancel("Nothing to configure")?;
         return Ok(());
     }
-    let applied = run_plans(plans, &mut state, args.yes, args.dry_run)?;
+    let applied = run_plans(plans, &mut state, args.yes, args.dry_run, &plan)?;
     if applied.is_empty() {
         return Ok(());
     }
-    let mut hints = Vec::new();
-    for id in &applied {
-        hints.push(match id {
-            HarnessId::Vscode => {
-                "VSCode: open the chat model picker; the models are listed under \"litellm\"."
-            }
-            HarnessId::Opencode => {
-                "opencode: run /models; the models are listed under \"LiteLLM\"."
-            }
-            HarnessId::Cursor => "Cursor: the models are enabled in Settings > Models.",
-        });
-    }
+    let hints: Vec<&str> = harnesses
+        .iter()
+        .filter(|h| applied.contains(&h.id()))
+        .map(|h| h.hint())
+        .collect();
     cliclack::outro(hints.join("\n"))?;
     Ok(())
 }
@@ -104,8 +108,9 @@ pub fn uninstall(harness_ids: Vec<HarnessId>, yes: bool, dry_run: bool) -> Resul
     cliclack::intro(" liteton uninstall ")?;
     let paths = HarnessPaths::default();
     let mut state = InstallState::load()?;
-    let recorded: Vec<HarnessId> = [HarnessId::Vscode, HarnessId::Opencode, HarnessId::Cursor]
-        .into_iter()
+    let recorded: Vec<HarnessId> = HarnessId::value_variants()
+        .iter()
+        .copied()
         .filter(|id| state.harnesses.contains_key(id.key()))
         .collect();
     if recorded.is_empty() {
@@ -143,7 +148,12 @@ pub fn uninstall(harness_ids: Vec<HarnessId>, yes: bool, dry_run: bool) -> Resul
         cliclack::outro_cancel("Nothing to remove")?;
         return Ok(());
     }
-    if !run_plans(plans, &mut state, yes, dry_run)?.is_empty() {
+    let records = state.harnesses.clone();
+    let replan = |id: HarnessId| match records.get(id.key()) {
+        Some(record) => harness::get(&paths, id).plan_uninstall(record),
+        None => bail!("nothing installed by liteton"),
+    };
+    if !run_plans(plans, &mut state, yes, dry_run, &replan)?.is_empty() {
         cliclack::outro("Removed")?;
     }
     Ok(())
@@ -361,12 +371,14 @@ fn decide_opencode_long_context(
 }
 
 /// Previews, confirms, closes apps if needed, backs up, applies and records each plan.
-/// Returns the harnesses that were written.
+/// Returns the harnesses that were written. opencode 1 and 2 share a config file, so a plan
+/// whose file an earlier plan just wrote is made again with `replan` on top of that write.
 fn run_plans(
     plans: Vec<Plan>,
     state: &mut InstallState,
     yes: bool,
     dry_run: bool,
+    replan: &dyn Fn(HarnessId) -> Result<Plan>,
 ) -> Result<Vec<HarnessId>> {
     let mut plans: Vec<Plan> = plans
         .into_iter()
@@ -418,17 +430,22 @@ fn run_plans(
     let backup_dir =
         config::backups_dir().join(chrono::Local::now().format("%Y%m%d-%H%M%S").to_string());
     let mut applied = Vec::new();
-    for plan in &plans {
+    let mut written: Vec<PathBuf> = Vec::new();
+    for plan in plans {
         let name = plan.harness.display_name();
-        let secrets = match unlock_secrets(plan) {
+        let secrets = match unlock_secrets(&plan) {
             Ok(secrets) => secrets,
             Err(e) => {
                 cliclack::log::error(format!("{name}: {e:#}"))?;
                 continue;
             }
         };
-        match harness::apply::apply(plan, &backup_dir, secrets.as_ref()) {
-            Ok(()) => {
+        match apply_or_replan(plan, &written, replan, &backup_dir, secrets.as_ref()) {
+            Ok(plan) => {
+                written.extend(plan.changes.iter().filter_map(|c| match c {
+                    harness::Change::File { path, .. } => Some(path.clone()),
+                    _ => None,
+                }));
                 match &plan.record {
                     Some(record) => state
                         .harnesses
@@ -446,6 +463,29 @@ fn run_plans(
         cliclack::log::info(format!("Backups saved in {}", backup_dir.display()))?;
     }
     Ok(applied)
+}
+
+/// Applies `plan`, or a fresh one when an earlier plan of this run changed its file.
+/// Returns the plan that was applied.
+fn apply_or_replan(
+    plan: Plan,
+    written: &[PathBuf],
+    replan: &dyn Fn(HarnessId) -> Result<Plan>,
+    backup_dir: &Path,
+    secrets: Option<&SecretWriter>,
+) -> Result<Plan> {
+    match harness::apply::apply(&plan, backup_dir, secrets) {
+        Ok(()) => Ok(plan),
+        Err(e)
+            if e.downcast_ref::<harness::apply::StalePlan>()
+                .is_some_and(|stale| written.contains(&stale.path)) =>
+        {
+            let fresh = replan(plan.harness)?;
+            harness::apply::apply(&fresh, backup_dir, secrets)?;
+            Ok(fresh)
+        }
+        Err(e) => Err(e),
+    }
 }
 
 /// The app keeps its database in memory and would overwrite our edits, so it must not run.
@@ -497,8 +537,10 @@ fn unlock_secrets(plan: &Plan) -> Result<Option<SecretWriter>> {
     let db_path = plan
         .changes
         .iter()
-        .find(|c| matches!(c, harness::Change::DbItem { .. }))
-        .map(|c| c.path().to_path_buf())
+        .find_map(|c| match c {
+            harness::Change::DbItem { db, .. } => Some(db.clone()),
+            _ => None,
+        })
         .unwrap();
     cliclack::log::info(format!(
         "macOS may ask you to allow access to \"{}\" in the Keychain; choose Allow.",

@@ -5,12 +5,33 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 
-use super::{Change, DbValue, Plan};
+use super::{Change, CommandBackup, DbValue, Plan, command, read_optional};
 use crate::vscdb::{SecretWriter, StateDb};
+
+#[derive(Debug)]
+pub struct StalePlan {
+    pub path: PathBuf,
+}
+
+impl std::fmt::Display for StalePlan {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} changed since the preview", self.path.display())
+    }
+}
+
+impl std::error::Error for StalePlan {}
 
 /// Backs up every touched file into `backup_dir`, then writes the plan.
 /// `secrets` must be provided when the plan writes encrypted values.
+/// Fails with [`StalePlan`] before writing anything if a file no longer matches the plan.
 pub fn apply(plan: &Plan, backup_dir: &Path, secrets: Option<&SecretWriter>) -> Result<()> {
+    for change in &plan.changes {
+        if let Change::File { path, before, .. } = change
+            && read_optional(path)? != *before
+        {
+            return Err(StalePlan { path: path.clone() }.into());
+        }
+    }
     let backup_dir = backup_dir.join(plan.harness.key());
     backup(plan, &backup_dir)?;
 
@@ -29,7 +50,7 @@ pub fn apply(plan: &Plan, backup_dir: &Path, secrets: Option<&SecretWriter>) -> 
                     DbValue::Secret(plaintext) => Some(
                         secrets
                             .ok_or_else(|| anyhow!("secret storage is not unlocked"))?
-                            .encode(plaintext),
+                            .encode(plaintext.expose()),
                     ),
                     DbValue::Delete => None,
                 };
@@ -37,6 +58,11 @@ pub fn apply(plan: &Plan, backup_dir: &Path, secrets: Option<&SecretWriter>) -> 
                     .entry(db.clone())
                     .or_default()
                     .push((key.clone(), value));
+            }
+            Change::Command { program, steps, .. } => {
+                for step in steps {
+                    command::run(program, step)?;
+                }
             }
         }
     }
@@ -49,10 +75,28 @@ pub fn apply(plan: &Plan, backup_dir: &Path, secrets: Option<&SecretWriter>) -> 
 }
 
 fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
-    let paths: BTreeSet<&Path> = plan.changes.iter().map(Change::path).collect();
+    for change in &plan.changes {
+        if let Change::Command {
+            program,
+            backup: Some(CommandBackup { step, file_name }),
+            ..
+        } = change
+        {
+            let saved = command::run(program, step)?;
+            crate::config::ensure_private_dir(backup_dir)?;
+            write_file(
+                &backup_path(backup_dir, Path::new(file_name), false),
+                &saved,
+                true,
+            )?;
+        }
+    }
+    let paths: BTreeSet<&Path> = plan.changes.iter().filter_map(Change::path).collect();
     let mut done: Vec<&Path> = Vec::new();
     for change in &plan.changes {
-        let path = change.path();
+        let Some(path) = change.path() else {
+            continue;
+        };
         if done.contains(&path) || !path.exists() {
             continue;
         }
@@ -68,6 +112,7 @@ fn backup(plan: &Plan, backup_dir: &Path) -> Result<()> {
                 fs::copy(path, &dest).with_context(|| format!("backing up {}", path.display()))?;
             }
             Change::DbItem { .. } => StateDb::open_readonly(path)?.backup_to(&dest)?,
+            Change::Command { .. } => {}
         }
         done.push(path);
     }
