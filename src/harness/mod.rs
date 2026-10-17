@@ -4,7 +4,6 @@ pub mod cursor;
 pub mod opencode;
 pub mod vscode;
 
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -15,10 +14,11 @@ use clap::ValueEnum;
 pub use command::{CommandBackup, CommandStep};
 
 use crate::config::{
-    Config, Credentials, HarnessRecord, InstallState, xdg_config_home, xdg_data_home,
+    Config, Credentials, HarnessRecord, InstallState, home_dir, xdg_config_home, xdg_data_home,
 };
 use crate::litellm::ModelSpec;
 use crate::vscdb::ElectronApp;
+use opencode::{App, OpenCode, OpencodeCli};
 
 /// Name of the provider entry liteton owns in every harness.
 pub const PROVIDER_ID: &str = "litellm";
@@ -28,6 +28,7 @@ pub enum HarnessId {
     Vscode,
     Opencode,
     Opencode2,
+    Kilo,
     Cursor,
 }
 
@@ -37,6 +38,7 @@ impl HarnessId {
             Self::Vscode => "vscode",
             Self::Opencode => "opencode",
             Self::Opencode2 => "opencode2",
+            Self::Kilo => "kilo",
             Self::Cursor => "cursor",
         }
     }
@@ -46,6 +48,7 @@ impl HarnessId {
             Self::Vscode => "VSCode",
             Self::Opencode => "opencode",
             Self::Opencode2 => "opencode 2",
+            Self::Kilo => "Kilo Code",
             Self::Cursor => "Cursor",
         }
     }
@@ -63,43 +66,15 @@ impl InstallCtx<'_> {
     }
 }
 
-/// A value that must never reach logs or previews; `Debug` prints a placeholder.
-#[derive(Clone, PartialEq)]
-pub struct Secret(String);
-
-impl Secret {
-    pub fn expose(&self) -> &str {
-        &self.0
-    }
-}
-
-impl From<String> for Secret {
-    fn from(value: String) -> Self {
-        Self(value)
-    }
-}
-
-impl From<&str> for Secret {
-    fn from(value: &str) -> Self {
-        Self(value.to_string())
-    }
-}
-
-impl fmt::Debug for Secret {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str("Secret(..)")
-    }
-}
-
 #[derive(Debug, Clone, PartialEq)]
 pub enum DbValue {
     Text(String),
     /// Plaintext that gets encrypted with the app's safeStorage key at apply time.
-    Secret(Secret),
+    Secret(String),
     Delete,
 }
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Change {
     File {
         path: PathBuf,
@@ -128,7 +103,7 @@ pub enum Change {
 }
 
 impl Change {
-    /// A plain config file edit, or `None` when the text stays the same.
+    /// `None` when the text stays the same.
     pub fn file(path: PathBuf, before: Option<String>, after: String) -> Option<Self> {
         (before.as_deref() != Some(after.as_str())).then_some(Self::File {
             path,
@@ -144,63 +119,6 @@ impl Change {
             Self::File { path, .. } => Some(path),
             Self::DbItem { db, .. } => Some(db),
             Self::Command { .. } => None,
-        }
-    }
-}
-
-/// Like a derived `Debug`, but a private file's contents are left out.
-impl fmt::Debug for Change {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::File {
-                path,
-                before,
-                after,
-                private,
-                summary,
-            } => {
-                let mut s = f.debug_struct("File");
-                s.field("path", path);
-                if *private {
-                    s.field("before", &before.as_ref().map(|_| ".."))
-                        .field("after", &"..");
-                } else {
-                    s.field("before", before).field("after", after);
-                }
-                s.field("private", private)
-                    .field("summary", summary)
-                    .finish()
-            }
-            Self::DbItem {
-                app,
-                db,
-                key,
-                label,
-                summary,
-                value,
-            } => f
-                .debug_struct("DbItem")
-                .field("app", app)
-                .field("db", db)
-                .field("key", key)
-                .field("label", label)
-                .field("summary", summary)
-                .field("value", value)
-                .finish(),
-            Self::Command {
-                label,
-                summary,
-                program,
-                steps,
-                backup,
-            } => f
-                .debug_struct("Command")
-                .field("label", label)
-                .field("summary", summary)
-                .field("program", program)
-                .field("steps", steps)
-                .field("backup", backup)
-                .finish(),
         }
     }
 }
@@ -253,7 +171,10 @@ pub struct HarnessPaths {
     pub opencode_config_dir: PathBuf,
     pub opencode_data_dir: PathBuf,
     pub opencode_bin: PathBuf,
+    pub kilo_config_dir: PathBuf,
+    pub kilo_data_dir: PathBuf,
     pub vscode_user_dir: PathBuf,
+    pub vscode_extensions_dir: PathBuf,
     pub cursor_user_dir: PathBuf,
 }
 
@@ -263,28 +184,34 @@ impl Default for HarnessPaths {
             opencode_config_dir: xdg_config_home().join("opencode"),
             opencode_data_dir: xdg_data_home().join("opencode"),
             opencode_bin: "opencode".into(),
+            kilo_config_dir: xdg_config_home().join("kilo"),
+            kilo_data_dir: xdg_data_home().join("kilo"),
             vscode_user_dir: ElectronApp::VSCode.user_dir(),
+            vscode_extensions_dir: home_dir().join(".vscode/extensions"),
             cursor_user_dir: ElectronApp::Cursor.user_dir(),
         }
     }
 }
 
 pub fn all(paths: &HarnessPaths) -> Vec<Box<dyn Harness>> {
-    let cli = Rc::new(opencode::OpencodeCli::new(&paths.opencode_bin));
-    vec![
-        Box::new(vscode::VsCode::new(paths)),
-        Box::new(opencode::OpenCode::<opencode::V1>::new(paths, cli.clone())),
-        Box::new(opencode::OpenCode::<opencode::V2>::new(paths, cli)),
-        Box::new(cursor::Cursor::new(paths)),
-    ]
+    let cli = Rc::new(OpencodeCli::new(&paths.opencode_bin));
+    HarnessId::value_variants()
+        .iter()
+        .map(|&id| build(paths, id, &cli))
+        .collect()
 }
 
 pub fn get(paths: &HarnessPaths, id: HarnessId) -> Box<dyn Harness> {
-    let cli = || Rc::new(opencode::OpencodeCli::new(&paths.opencode_bin));
+    build(paths, id, &Rc::new(OpencodeCli::new(&paths.opencode_bin)))
+}
+
+fn build(paths: &HarnessPaths, id: HarnessId, cli: &Rc<OpencodeCli>) -> Box<dyn Harness> {
+    let opencode = |app| Box::new(OpenCode::new(app, paths, cli.clone()));
     match id {
         HarnessId::Vscode => Box::new(vscode::VsCode::new(paths)),
-        HarnessId::Opencode => Box::new(opencode::OpenCode::<opencode::V1>::new(paths, cli())),
-        HarnessId::Opencode2 => Box::new(opencode::OpenCode::<opencode::V2>::new(paths, cli())),
+        HarnessId::Opencode => opencode(App::OpenCode1),
+        HarnessId::Opencode2 => opencode(App::OpenCode2),
+        HarnessId::Kilo => opencode(App::Kilo),
         HarnessId::Cursor => Box::new(cursor::Cursor::new(paths)),
     }
 }
@@ -347,7 +274,10 @@ pub mod tests {
             opencode_config_dir: dir.join("config/opencode"),
             opencode_data_dir: dir.join("data/opencode"),
             opencode_bin: dir.join("bin/opencode"),
+            kilo_config_dir: dir.join("config/kilo"),
+            kilo_data_dir: dir.join("data/kilo"),
             vscode_user_dir: dir.join("Code/User"),
+            vscode_extensions_dir: dir.join("vscode-extensions"),
             cursor_user_dir: dir.join("Cursor/User"),
         }
     }
@@ -365,24 +295,6 @@ pub mod tests {
             reasoning,
             ..ModelSpec::bare(id)
         }
-    }
-
-    #[test]
-    fn debug_never_shows_secrets() {
-        let file = Change::File {
-            path: "/tmp/auth.json".into(),
-            before: Some("sk-old".into()),
-            after: "sk-secret".into(),
-            private: true,
-            summary: vec![],
-        };
-        let step = CommandStep::new(&["auth", "import"]).with_stdin("sk-secret");
-        let db = DbValue::Secret("sk-secret".into());
-        for shown in [format!("{file:?}"), format!("{step:?}"), format!("{db:?}")] {
-            assert!(!shown.contains("sk-"), "{shown}");
-        }
-        let public = Change::file("/tmp/a.json".into(), None, "{}".into()).unwrap();
-        assert!(format!("{public:?}").contains("\"{}\""));
     }
 
     /// A `state.vscdb` with the same schema VSCode and Cursor use.

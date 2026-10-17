@@ -160,7 +160,7 @@ impl Harness for Cursor {
                     "{} the API key (encrypted with \"Cursor Safe Storage\")",
                     if secret_existed { "replace" } else { "store" }
                 )],
-                value: DbValue::Secret(ctx.creds.api_key.clone().into()),
+                value: DbValue::Secret(ctx.creds.api_key.clone()),
             });
         }
 

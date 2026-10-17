@@ -9,6 +9,7 @@ Run `liteton install`, pick your tools and models, and liteton adds a `litellm` 
 | **VSCode** (Copilot Chat) | A `litellm` custom endpoint in `chatLanguageModels.json`. The API key goes into VSCode's encrypted secret storage. |
 | **opencode** | A `litellm` provider in `opencode.jsonc`/`opencode.json`. The API key goes into opencode's `auth.json`. |
 | **opencode 2** | A `litellm` entry under `providers` in the same file, in the v2 format. The API key is stored with `opencode auth import`. |
+| **Kilo Code** | A `litellm` provider in `~/.config/kilo/kilo.jsonc`, read by the Kilo CLI, the VS Code extension and the JetBrains plugin. The API key goes into Kilo's `auth.json`. |
 | **Cursor** (experimental) | The OpenAI base URL override, the enabled models, and the OpenAI API key in Cursor's settings. |
 
 > **macOS only.** liteton uses the macOS Keychain and the macOS paths of VSCode and Cursor.
@@ -69,7 +70,7 @@ liteton install --yes                             # no prompts
 
 | Option | Description |
 |---|---|
-| `--harness <vscode\|opencode\|opencode2\|cursor>...` | Harnesses to configure. Without it, liteton asks and preselects the ones it detects. Cursor is never preselected. |
+| `--harness <vscode\|opencode\|opencode2\|kilo\|cursor>...` | Harnesses to configure. Without it, liteton asks and preselects the ones it detects. Cursor is never preselected. |
 | `--models <id>...` | Model ids to install. Without it, liteton asks. On later runs, the models you installed before are preselected. |
 | `--dry-run` | Show the changes without writing anything. |
 | `-y`, `--yes` | Skip confirmation prompts. Cursor warnings are still printed. |
@@ -131,6 +132,27 @@ liteton reads the models your key may use from `/v1/models`. It gets context win
 - Long-context prices are written exactly. opencode 2's `cost` takes a list of context tiers, so every `above_<N>k_tokens` price from LiteLLM becomes its own tier, e.g. above 100k or 272k. opencode 1 only has a slot at 200k.
 - opencode 2 reads `auth.json` only once, when it first starts. So liteton adds its own credential (`cred_liteton_litellm`) with `opencode auth import` and makes it the active LiteLLM credential. Your other credentials are kept, and `liteton uninstall` removes only that one with `opencode auth logout`. This needs opencode 2 as the `opencode` on your `PATH`.
 - If you installed with opencode 1 and then migrated your config, the first opencode 2 install takes over the opencode 1 record, so `uninstall` still removes the models liteton added.
+
+### Kilo Code
+
+- Kilo Code is built on opencode 1, and its CLI, VS Code extension and JetBrains plugin share one config. liteton writes `provider.litellm` in the opencode 1 format to `~/.config/kilo/kilo.jsonc`. If you already use `kilo.json`, `opencode.jsonc`, `opencode.json` or `config.json` there, liteton writes the first of those that exists, which is the same file Kilo saves its settings to.
+- The API key goes into `~/.local/share/kilo/auth.json`. Other entries are kept, and the file is written with mode `0600`.
+- You can run liteton before installing the extension. Kilo only creates a config when none exists, and it edits the file in place when you change settings, so liteton's entry stays. A running extension picks up the change without a restart.
+- The legacy Kilo Code extension (v4 and earlier) kept providers in VS Code settings and is not supported.
+- Long-context pricing works as in opencode 1, including the `opencode_approximate_long_context` setting.
+- Kilo uses only LiteLLM. liteton sets these in Kilo's config, and `uninstall` puts back the values you had before:
+
+  | Key | Value | Why |
+  |---|---|---|
+  | `enabled_providers` | `["litellm"]` | Hides the Kilo Gateway and every other provider |
+  | `model` | `litellm/<model>` | The default chat model; Kilo's own default is a Kilo Gateway model |
+  | `small_model` | `litellm/<model>` | Used for titles and summaries |
+  | `share` | `"disabled"` | No session sharing through Kilo's servers |
+  | `remote_control` | `false` | No remote control through Kilo Cloud |
+  | `experimental.openTelemetry` | `false` | No telemetry |
+
+- `install` asks for the default and the small model the first time, preselecting the cheapest model for the small one, and saves your answers as `kilo_model` and `kilo_small_model` in `~/.config/liteton/config.toml`. With `--yes` it takes the first selected model and the cheapest one.
+- Kilo's autocomplete only works with the Kilo Gateway, Mistral or Inception, not LiteLLM. If the Kilo VS Code extension is installed, liteton turns it off and sets the default model (`kilo-code.new.autocomplete.enableAutoTrigger`, `kilo-code.new.model.providerID`, `kilo-code.new.model.modelID`) in the `settings.json` of every VS Code profile that has its own settings. Profiles that share the Default profile's settings get them from there. In JetBrains IDEs, turn off autocomplete yourself under Settings > Kilo Code > Autocomplete.
 
 ### Cursor (experimental)
 
@@ -194,6 +216,8 @@ reasoning_efforts = ["low", "medium", "high"]
 
 Run `liteton install` again afterwards to apply the change.
 
+In opencode and Kilo configs, each effort variant liteton writes goes on one line, e.g. `{ "id": "low", "settings": { "reasoningEffort": "low" } }`. Variants you wrote yourself keep their layout. Configs written by an older liteton are reformatted this way on the next `install`.
+
 ## Troubleshooting
 
 | Problem | Fix |
@@ -221,7 +245,7 @@ Code layout:
 | `src/cli.rs` | Command-line arguments |
 | `src/config.rs` | Config, credentials, install state |
 | `src/litellm/` | LiteLLM API client, model metadata, budget |
-| `src/harness/` | One module per harness; each produces a plan of changes that `apply.rs` writes |
+| `src/harness/` | One module per harness; each produces a plan of changes that `apply.rs` writes. `opencode/` covers opencode 1, opencode 2 and Kilo Code: a `Schema` per config format and an `App` per tool |
 | `src/vscdb/` | Reading/writing `state.vscdb` and Electron safeStorage encryption |
 | `src/ui/` | Prompts, install flow, tables, dashboard |
 

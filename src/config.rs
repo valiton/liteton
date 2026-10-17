@@ -25,6 +25,10 @@ pub struct Config {
     /// threshold. Unset means `liteton install` asks.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub opencode_approximate_long_context: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kilo_model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kilo_small_model: Option<String>,
 }
 
 impl Config {

@@ -114,7 +114,7 @@ pub async fn fetch_budget(
     client.ping_budget(&model.id).await.map(Some)
 }
 
-fn cheapest(models: &[ModelSpec]) -> Option<&ModelSpec> {
+pub fn cheapest(models: &[ModelSpec]) -> Option<&ModelSpec> {
     models.iter().min_by(|a, b| {
         let cost = |m: &ModelSpec| {
             m.pricing.input.unwrap_or(f64::MAX) + m.pricing.output.unwrap_or(f64::MAX)
@@ -128,6 +128,24 @@ mod tests {
     use super::*;
     use reqwest::header::HeaderValue;
     use serde_json::json;
+
+    #[test]
+    fn cheapest_skips_unpriced_models() {
+        let priced = |id: &str, input, output| ModelSpec {
+            pricing: crate::litellm::Pricing {
+                input: Some(input),
+                output: Some(output),
+                ..Default::default()
+            },
+            ..ModelSpec::bare(id)
+        };
+        let models = vec![
+            ModelSpec::bare("free?"),
+            priced("haiku", 0.1, 0.5),
+            priced("opus", 4.0, 20.0),
+        ];
+        assert_eq!(cheapest(&models).unwrap().id, "haiku");
+    }
 
     #[test]
     fn parses_key_info() {
