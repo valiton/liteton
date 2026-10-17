@@ -18,6 +18,7 @@ use crate::vscdb::{ElectronApp, StateDb, secret_key};
 const VENDOR: &str = "customendpoint";
 const DEFAULT_SECRET: &str = "chat.lm.secret.liteton";
 const MODELS_FILE: &str = "chatLanguageModels.json";
+const SETTINGS_FILE: &str = "settings.json";
 
 pub struct VsCode {
     user_dir: PathBuf,
@@ -57,10 +58,10 @@ impl VsCode {
         self.user_dir.join("globalStorage/state.vscdb")
     }
 
-    /// VSCode reads `chatLanguageModels.json` from each profile's folder, except for profiles
-    /// with `useDefaultFlags.languageModels`, which read the Default profile's. The profile list
+    /// VSCode reads `file` (e.g. `chatLanguageModels.json`) from each profile's folder, except for
+    /// profiles with `useDefaultFlags.<flag>`, which read the Default profile's. The profile list
     /// lives in `globalStorage/storage.json`; if it can't be read, folders with the file are used.
-    fn profiles(&self) -> Profiles {
+    fn profiles(&self, flag: &str, file: &str) -> Profiles {
         let mut profiles = Profiles {
             own: vec![Profile {
                 key: String::new(),
@@ -85,7 +86,7 @@ impl VsCode {
                 .as_str()
                 .map(str::to_string)
                 .unwrap_or_else(|| self.key_for(&dir));
-            if profile["useDefaultFlags"]["languageModels"] == json!(true) {
+            if profile["useDefaultFlags"][flag] == json!(true) {
                 profiles.shared.push(name);
                 shared_dirs.push(dir);
             } else if !profiles.own.iter().any(|p| p.dir == dir) {
@@ -99,7 +100,7 @@ impl VsCode {
         if complete {
             return profiles;
         }
-        for dir in self.profile_dirs_with_models() {
+        for dir in self.profile_dirs_with(file) {
             if !profiles.own.iter().any(|p| p.dir == dir) && !shared_dirs.contains(&dir) {
                 profiles.own.push(Profile {
                     key: self.key_for(&dir),
@@ -147,8 +148,8 @@ impl VsCode {
     }
 
     /// Profile folders (`profiles/<id>` and built-in `profiles/builtin/<name>`) that already
-    /// have a `chatLanguageModels.json`.
-    fn profile_dirs_with_models(&self) -> Vec<PathBuf> {
+    /// have `file`.
+    fn profile_dirs_with(&self, file: &str) -> Vec<PathBuf> {
         let mut found = Vec::new();
         let mut pending = vec![(self.user_dir.join("profiles"), 0)];
         while let Some((dir, depth)) = pending.pop() {
@@ -156,7 +157,7 @@ impl VsCode {
                 continue;
             };
             for path in entries.flatten().map(|e| e.path()).filter(|p| p.is_dir()) {
-                if path.join(MODELS_FILE).is_file() {
+                if path.join(file).is_file() {
                     found.push(path.clone());
                 }
                 if depth == 0 {
@@ -166,6 +167,19 @@ impl VsCode {
         }
         found.sort();
         found
+    }
+
+    fn model_profiles(&self) -> Profiles {
+        self.profiles("languageModels", MODELS_FILE)
+    }
+
+    /// `(key, settings.json)` for each profile with its own settings, Default (key "") first.
+    pub fn settings_files(&self) -> Vec<(String, PathBuf)> {
+        self.profiles("settings", SETTINGS_FILE)
+            .own
+            .into_iter()
+            .map(|p| (p.key, p.dir.join(SETTINGS_FILE)))
+            .collect()
     }
 }
 
@@ -183,7 +197,7 @@ impl Harness for VsCode {
     }
 
     fn is_installed(&self) -> bool {
-        self.profiles()
+        self.model_profiles()
             .own
             .iter()
             .any(|p| has_entry(&p.models_path()))
@@ -197,7 +211,7 @@ impl Harness for VsCode {
                 db_path.display()
             );
         }
-        let profiles = self.profiles();
+        let profiles = self.model_profiles();
         let previous = record
             .map(HarnessRecord::profile_records)
             .unwrap_or_default();
@@ -265,7 +279,7 @@ impl Harness for VsCode {
                         "{} the API key (encrypted with \"Code Safe Storage\")",
                         if existed { "replace" } else { "store" }
                     )],
-                    value: DbValue::Secret(ctx.creds.api_key.clone().into()),
+                    value: DbValue::Secret(ctx.creds.api_key.clone()),
                 });
             }
         }

@@ -1,8 +1,9 @@
-//! opencode 1 and 2 read the same config file, each from its own top-level key that the other
-//! ignores. The install flow lives here; `v1` and `v2` say how their schemas differ.
+//! opencode 1, opencode 2 and Kilo Code (an opencode 1 fork) share one install flow.
 
 mod auth_file;
 mod cli;
+mod format;
+mod kilo;
 mod v1;
 mod v2;
 mod variants;
@@ -15,89 +16,139 @@ use jsonc_parser::cst::CstObject;
 use serde_json::{Map, Value, json};
 
 pub use cli::OpencodeCli;
-pub use v1::{V1, approximated_tier};
-pub use v2::V2;
+pub use v1::approximated_tier;
 
 use super::{
-    Change, Harness, HarnessId, HarnessPaths, InstallCtx, PROVIDER_ID, Plan, deselected,
-    next_record, read_optional,
+    Change, Harness, HarnessId, HarnessPaths, InstallCtx, PROVIDER_ID, Plan, binary_on_path,
+    deselected, next_record, read_optional,
 };
-use crate::config::{Config, HarnessRecord, InstallState};
+use crate::config::{Config, HarnessRecord, InstallState, key_fingerprint};
 use crate::jsonc;
 use crate::litellm::ModelSpec;
+use auth_file::AuthFile;
+use cli::CliCredentials;
+use format::Format;
 
-/// Everything that differs between opencode versions.
-pub trait Version: 'static {
-    const HARNESS: HarnessId;
-    /// The top-level key holding the providers.
-    const ROOT_KEY: &'static str;
-    const CLI_MAJOR: u32;
-    const HINT: &'static str;
-    type Store: CredentialStore;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum App {
+    OpenCode1,
+    OpenCode2,
+    Kilo,
+}
 
-    fn store(paths: &HarnessPaths, cli: Rc<OpencodeCli>) -> Self::Store;
-    /// Points the provider at LiteLLM.
-    fn set_connection(provider: &CstObject, base_url: &str);
-    fn model_entry(model: &ModelSpec, config: &Config) -> Value;
-    /// The variant liteton writes for one effort level.
-    fn effort_variant(level: &str) -> Value;
-    fn read_variants(variants: &Value) -> Vec<(String, Value)>;
-    fn write_variants(variants: Vec<(String, Value)>) -> Value;
-
-    /// Runs after a model's entry is written.
-    fn tidy_model(_models: &CstObject, _model: &ModelSpec, _config: &Config) {}
-
-    /// Whether this version looks present when the CLI's version is unknown.
-    fn detect_without_cli(_config: Option<&Value>, _config_dir_exists: bool) -> bool {
-        false
+impl App {
+    fn id(self) -> HarnessId {
+        match self {
+            Self::OpenCode1 => HarnessId::Opencode,
+            Self::OpenCode2 => HarnessId::Opencode2,
+            Self::Kilo => HarnessId::Kilo,
+        }
     }
 
-    fn inherited_record(_config: Option<&Value>, _state: &InstallState) -> Option<HarnessRecord> {
-        None
+    fn format(self) -> Format {
+        match self {
+            Self::OpenCode1 | Self::Kilo => Format::V1,
+            Self::OpenCode2 => Format::V2,
+        }
+    }
+
+    fn hint(self) -> &'static str {
+        match self {
+            Self::OpenCode1 => "opencode: run /models; the models are listed under \"LiteLLM\".",
+            Self::OpenCode2 => "opencode 2: run /models; the models are listed under \"LiteLLM\".",
+            Self::Kilo => "Kilo Code: the models are listed under \"LiteLLM\" in the model picker.",
+        }
+    }
+
+    fn schema_url(self) -> &'static str {
+        match self {
+            Self::OpenCode1 | Self::OpenCode2 => "https://opencode.ai/config.json",
+            Self::Kilo => "https://app.kilo.ai/config.json",
+        }
+    }
+
+    fn config_files(self) -> &'static [&'static str] {
+        match self {
+            Self::OpenCode1 | Self::OpenCode2 => &["opencode.jsonc", "opencode.json"],
+            // Kilo reads all of these and saves its settings to the first one that exists.
+            Self::Kilo => &[
+                "kilo.jsonc",
+                "kilo.json",
+                "opencode.jsonc",
+                "opencode.json",
+                "config.json",
+            ],
+        }
     }
 }
 
-/// Where a version keeps the API key.
-pub trait CredentialStore {
-    fn plan_set(&self, api_key: &str, record: Option<&HarnessRecord>) -> Result<CredentialPlan>;
-    fn plan_remove(&self) -> Result<CredentialPlan>;
+enum Keys {
+    File(AuthFile),
+    Cli(CliCredentials),
 }
 
 #[derive(Debug, Default)]
-pub struct CredentialPlan {
-    pub change: Option<Change>,
-    /// Saved as the record's `created_secret`.
-    pub created: Option<String>,
-    /// Saved as the record's `key_fingerprint`.
-    pub fingerprint: Option<String>,
-    /// Shown instead of failing when the store can't be changed now.
-    pub note: Option<String>,
+struct KeyChange {
+    change: Option<Change>,
+    created: Option<String>,
 }
 
-pub struct OpenCode<V: Version> {
-    config_dir: PathBuf,
-    cli: Rc<OpencodeCli>,
-    store: V::Store,
-}
-
-impl<V: Version> OpenCode<V> {
-    pub fn new(paths: &HarnessPaths, cli: Rc<OpencodeCli>) -> Self {
-        Self {
-            config_dir: paths.opencode_config_dir.clone(),
-            store: V::store(paths, cli.clone()),
-            cli,
+impl Keys {
+    fn plan_set(&self, api_key: &str, record: Option<&HarnessRecord>) -> Result<KeyChange> {
+        match self {
+            Self::File(file) => file.plan(Some(api_key)),
+            Self::Cli(cli) => cli.plan_set(api_key, record),
         }
     }
 
-    /// Prefers `opencode.jsonc`, then `opencode.json`, and creates `opencode.jsonc` if neither exists.
-    fn config_path(&self) -> PathBuf {
-        let jsonc = self.config_dir.join("opencode.jsonc");
-        let json = self.config_dir.join("opencode.json");
-        if jsonc.exists() || !json.exists() {
-            jsonc
-        } else {
-            json
+    fn plan_remove(&self, notes: &mut Vec<String>) -> Result<Option<Change>> {
+        match self {
+            Self::File(file) => Ok(file.plan(None)?.change),
+            Self::Cli(cli) => Ok(cli.plan_remove(notes)),
         }
+    }
+}
+
+pub struct OpenCode {
+    app: App,
+    paths: HarnessPaths,
+    config_dir: PathBuf,
+    cli: Rc<OpencodeCli>,
+    keys: Keys,
+}
+
+impl OpenCode {
+    pub fn new(app: App, paths: &HarnessPaths, cli: Rc<OpencodeCli>) -> Self {
+        let (config_dir, keys) = match app {
+            App::OpenCode1 => (
+                paths.opencode_config_dir.clone(),
+                Keys::File(AuthFile::new(paths.opencode_data_dir.join("auth.json"))),
+            ),
+            App::OpenCode2 => (
+                paths.opencode_config_dir.clone(),
+                Keys::Cli(CliCredentials::new(cli.clone())),
+            ),
+            App::Kilo => (
+                paths.kilo_config_dir.clone(),
+                Keys::File(AuthFile::new(paths.kilo_data_dir.join("auth.json"))),
+            ),
+        };
+        Self {
+            app,
+            paths: paths.clone(),
+            config_dir,
+            cli,
+            keys,
+        }
+    }
+
+    fn config_path(&self) -> PathBuf {
+        let files = self.app.config_files();
+        files
+            .iter()
+            .map(|name| self.config_dir.join(name))
+            .find(|path| path.exists())
+            .unwrap_or_else(|| self.config_dir.join(files[0]))
     }
 
     fn config_value(&self) -> Option<Value> {
@@ -108,85 +159,110 @@ impl<V: Version> OpenCode<V> {
     }
 }
 
-impl<V: Version> Harness for OpenCode<V> {
+impl Harness for OpenCode {
     fn id(&self) -> HarnessId {
-        V::HARNESS
+        self.app.id()
     }
 
     fn detect(&self) -> bool {
         let config = self.config_value();
-        if config
-            .as_ref()
-            .is_some_and(|v| v.get(V::ROOT_KEY).is_some())
-        {
+        let has = |key: &str| config.as_ref().is_some_and(|v| v.get(key).is_some());
+        if has(self.app.format().root_key()) {
             return true;
         }
-        match self.cli.major() {
-            Some(major) => major == V::CLI_MAJOR,
-            None => V::detect_without_cli(config.as_ref(), self.config_dir.exists()),
+        match self.app {
+            App::OpenCode1 => match self.cli.major() {
+                Some(major) => major == 1,
+                None => {
+                    (self.config_dir.exists() || binary_on_path("opencode"))
+                        && !has(Format::V2.root_key())
+                }
+            },
+            App::OpenCode2 => self.cli.major() == Some(2),
+            App::Kilo => self.config_dir.exists() || binary_on_path("kilo"),
         }
     }
 
     fn is_installed(&self) -> bool {
         self.config_value()
-            .is_some_and(|v| v[V::ROOT_KEY][PROVIDER_ID].is_object())
+            .is_some_and(|v| v[self.app.format().root_key()][PROVIDER_ID].is_object())
     }
 
     fn hint(&self) -> &'static str {
-        V::HINT
+        self.app.hint()
     }
 
+    /// After a migration to opencode 2, the opencode 1 record still lists what liteton added.
     fn inherited_record(&self, state: &InstallState) -> Option<HarnessRecord> {
-        V::inherited_record(self.config_value().as_ref(), state)
+        let migrated = self
+            .config_value()
+            .is_none_or(|v| !v[Format::V1.root_key()][PROVIDER_ID].is_object());
+        if self.app != App::OpenCode2 || !migrated {
+            return None;
+        }
+        let v1 = state.harnesses.get(HarnessId::Opencode.key())?;
+        Some(HarnessRecord {
+            added_models: v1.added_models.clone(),
+            created_provider: v1.created_provider,
+            ..HarnessRecord::default()
+        })
     }
 
     fn plan_install(&self, ctx: &InstallCtx, record: Option<&HarnessRecord>) -> Result<Plan> {
+        let format = self.app.format();
         let path = self.config_path();
         let before = read_optional(&path)?;
         let root = jsonc::parse(before.as_deref().unwrap_or(""))?;
         let obj = root.object_value_or_set();
         if before.is_none() {
-            jsonc::set_if_missing(&obj, "$schema", &json!("https://opencode.ai/config.json"));
+            jsonc::set_if_missing(&obj, "$schema", &json!(self.app.schema_url()));
         }
-        let providers = child_object(&obj, V::ROOT_KEY, V::ROOT_KEY, &path)?;
+        let providers = child_object(&obj, format.root_key(), &path)?;
         let created_provider = providers.get(PROVIDER_ID).is_none();
-        let provider_path = format!("{}.{PROVIDER_ID}", V::ROOT_KEY);
-        let provider = child_object(&providers, PROVIDER_ID, &provider_path, &path)?;
+        let provider = child_object(&providers, PROVIDER_ID, &path)?;
         jsonc::set_if_missing(&provider, "name", &json!("LiteLLM"));
-        V::set_connection(&provider, &ctx.openai_base_url());
-        let models = child_object(
-            &provider,
-            "models",
-            &format!("{provider_path}.models"),
-            &path,
-        )?;
+        format.set_connection(&provider, &ctx.openai_base_url());
+        let models = child_object(&provider, "models", &path)?;
 
         let mut newly_added = Vec::new();
         for model in ctx.models {
-            if write_model::<V>(&models, model, ctx.config) {
+            if models.get(&model.id).is_none() {
                 newly_added.push(model.id.clone());
             }
+            write_model(&models, model, ctx.config, format);
         }
         let removed = deselected(record, ctx.models);
         remove_models(&models, removed.iter().copied());
+        let mut previous = record.map(|r| r.previous.clone()).unwrap_or_default();
+        if self.app == App::Kilo {
+            let settings = kilo::config_settings(ctx.config, ctx.models);
+            kilo::apply(&obj, &settings, kilo::CONFIG, &mut previous);
+        }
 
-        let after = jsonc::finish(&root, before.as_deref());
+        let after = inline_effort_variants(&jsonc::finish(&root, before.as_deref()), format)?;
         let mut changes: Vec<Change> = Change::file(path, before, after).into_iter().collect();
-        let credential = self.store.plan_set(&ctx.creds.api_key, record)?;
-        changes.extend(credential.change);
+        let keys = self.keys.plan_set(&ctx.creds.api_key, record)?;
+        changes.extend(keys.change);
+        if self.app == App::Kilo {
+            changes.extend(kilo::plan_vscode_install(
+                &self.paths,
+                ctx.config,
+                ctx.models,
+                &mut previous,
+            )?);
+        }
 
         let mut next = next_record(
             record,
             newly_added,
             &removed,
             created_provider,
-            credential.created,
+            keys.created,
         );
-        if credential.fingerprint.is_some() {
-            next.key_fingerprint = credential.fingerprint;
-        }
+        next.key_fingerprint = Some(key_fingerprint(&ctx.creds.api_key));
+        next.previous = previous;
         Ok(Plan {
-            harness: V::HARNESS,
+            harness: self.app.id(),
             changes,
             record: Some(next),
             notes: vec![],
@@ -199,9 +275,9 @@ impl<V: Version> Harness for OpenCode<V> {
         let path = self.config_path();
         if let Some(before) = read_optional(&path)? {
             let root = jsonc::parse(&before)?;
-            if let Some(providers) = root
-                .object_value()
-                .and_then(|o| o.object_value(V::ROOT_KEY))
+            let root_key = self.app.format().root_key();
+            if let Some(obj) = root.object_value()
+                && let Some(providers) = obj.object_value(root_key)
                 && let Some(provider) = providers.object_value(PROVIDER_ID)
             {
                 if let Some(models) = provider.object_value("models") {
@@ -215,18 +291,29 @@ impl<V: Version> Harness for OpenCode<V> {
                     && let Some(prop) = providers.get(PROVIDER_ID)
                 {
                     prop.remove();
+                    if providers.properties().is_empty()
+                        && let Some(prop) = obj.get(root_key)
+                    {
+                        prop.remove();
+                    }
                 }
+            }
+            if self.app == App::Kilo
+                && let Some(obj) = root.object_value()
+            {
+                kilo::restore(&obj, kilo::CONFIG, &record.previous);
             }
             let after = jsonc::finish(&root, Some(&before));
             changes.extend(Change::file(path, Some(before), after));
         }
         if record.created_secret.is_some() {
-            let credential = self.store.plan_remove()?;
-            changes.extend(credential.change);
-            notes.extend(credential.note);
+            changes.extend(self.keys.plan_remove(&mut notes)?);
+        }
+        if self.app == App::Kilo {
+            changes.extend(kilo::plan_vscode_uninstall(&self.paths, &record.previous)?);
         }
         Ok(Plan {
-            harness: V::HARNESS,
+            harness: self.app.id(),
             changes,
             record: None,
             notes,
@@ -234,19 +321,19 @@ impl<V: Version> Harness for OpenCode<V> {
     }
 }
 
-/// `parent[key]`, created if missing. `shown` names it in the error.
-fn child_object(parent: &CstObject, key: &str, shown: &str, path: &Path) -> Result<CstObject> {
+fn child_object(parent: &CstObject, key: &str, path: &Path) -> Result<CstObject> {
     parent
         .object_value_or_create(key)
-        .ok_or_else(|| anyhow!("\"{shown}\" in {} is not an object", path.display()))
+        .ok_or_else(|| anyhow!("\"{key}\" in {} is not an object", path.display()))
 }
 
-/// Merges liteton's entry for one model and syncs its variants. Returns whether the entry is new.
-fn write_model<V: Version>(models: &CstObject, model: &ModelSpec, config: &Config) -> bool {
-    let mut value = V::model_entry(model, config);
-    let existing = models.object_value(&model.id);
+fn write_model(models: &CstObject, model: &ModelSpec, config: &Config, format: Format) {
+    let mut value = format.model_entry(model, config);
     // A display name the user picked wins over ours.
-    if existing.as_ref().is_some_and(|e| e.get("name").is_some()) {
+    if models
+        .object_value(&model.id)
+        .is_some_and(|e| e.get("name").is_some())
+    {
         value.as_object_mut().unwrap().remove("name");
     }
     let mut entry = Map::new();
@@ -257,9 +344,22 @@ fn write_model<V: Version>(models: &CstObject, model: &ModelSpec, config: &Confi
     } else {
         Vec::new()
     };
-    variants::sync::<V>(models, &model.id, &efforts);
-    V::tidy_model(models, model, config);
-    existing.is_none()
+    variants::sync(models, &model.id, &efforts, format);
+    format.tidy_model(models, model, config);
+}
+
+fn inline_effort_variants(text: &str, format: Format) -> Result<String> {
+    let path = [
+        format.root_key(),
+        PROVIDER_ID,
+        "models",
+        "*",
+        "variants",
+        "*",
+    ];
+    jsonc::inline_objects(text, &path, |key, variant| {
+        *variant == format.effort_variant(format.variant_id(key, variant))
+    })
 }
 
 fn remove_models<'a>(models: &CstObject, ids: impl IntoIterator<Item = &'a String>) {
@@ -267,20 +367,6 @@ fn remove_models<'a>(models: &CstObject, ids: impl IntoIterator<Item = &'a Strin
         if let Some(prop) = models.get(id) {
             prop.remove();
         }
-    }
-}
-
-/// `limit`, shared by both versions.
-fn limit(model: &ModelSpec) -> Option<Value> {
-    let (context, output) = (model.context_window?, model.max_output_tokens?);
-    Some(json!({"context": context, "output": output}))
-}
-
-fn input_modalities(model: &ModelSpec) -> Value {
-    if model.vision {
-        json!(["text", "image"])
-    } else {
-        json!(["text"])
     }
 }
 
@@ -312,14 +398,19 @@ mod tests {
         }
 
         pub fn write_config(&self, name: &str, text: &str) -> PathBuf {
-            std::fs::create_dir_all(&self.paths.opencode_config_dir).unwrap();
-            let path = self.paths.opencode_config_dir.join(name);
+            self.write_in(&self.paths.opencode_config_dir, name, text)
+        }
+
+        pub fn write_in(&self, dir: &Path, name: &str, text: &str) -> PathBuf {
+            std::fs::create_dir_all(dir).unwrap();
+            let path = dir.join(name);
             std::fs::write(&path, text).unwrap();
             path
         }
 
-        pub fn harness<V: Version>(&self) -> OpenCode<V> {
+        pub fn harness(&self, app: App) -> OpenCode {
             OpenCode::new(
+                app,
                 &self.paths,
                 Rc::new(OpencodeCli::new(&self.paths.opencode_bin)),
             )
@@ -383,7 +474,7 @@ mod tests {
 
         let config = Config::default();
         let models = vec![spec("azure/gpt-5.4-nano", true)];
-        let harness = fx.harness::<V1>();
+        let harness = fx.harness(App::OpenCode1);
         let plan = fx.install(&harness, &models, &config, None);
         fx.apply(&plan).unwrap();
 
@@ -442,7 +533,7 @@ mod tests {
         );
         let config = Config::default();
         let models = vec![spec("azure/gpt-5.4-nano", false)];
-        let harness = fx.harness::<V1>();
+        let harness = fx.harness(App::OpenCode1);
         let plan = fx.install(&harness, &models, &config, None);
         fx.apply(&plan).unwrap();
 
@@ -506,7 +597,7 @@ mod tests {
         sol.pricing.cache_read = Some(0.01);
         sol.reasoning_efforts = Some(vec!["low".into(), "high".into(), "max".into()]);
         let models = vec![sol, spec("plain", false)];
-        let harness = fx.harness::<V2>();
+        let harness = fx.harness(App::OpenCode2);
         assert!(harness.detect() && harness.is_installed());
         let plan = fx.install(&harness, &models, &config, None);
 
@@ -517,7 +608,6 @@ mod tests {
             .unwrap();
         let preview = crate::ui::strip_ansi(&crate::ui::change_preview(command));
         assert!(!preview.contains("sk-secret"), "{preview}");
-        assert!(!format!("{command:?}").contains("sk-secret"));
         fx.apply(&plan).unwrap();
 
         let text = std::fs::read_to_string(&config_path).unwrap();
@@ -604,7 +694,10 @@ mod tests {
             models: &[spec("m", false)],
             config: &Config::default(),
         };
-        let err = fx.harness::<V2>().plan_install(&ctx, None).unwrap_err();
+        let err = fx
+            .harness(App::OpenCode2)
+            .plan_install(&ctx, None)
+            .unwrap_err();
         assert!(format!("{err:#}").contains("opencode 2 was not found"));
     }
 
@@ -615,8 +708,8 @@ mod tests {
         cli::tests::fake_cli(&fx.paths, "[]");
         let config = Config::default();
         let models = vec![spec("m", true)];
-        let v1 = fx.harness::<V1>();
-        let v2 = fx.harness::<V2>();
+        let v1 = fx.harness(App::OpenCode1);
+        let v2 = fx.harness(App::OpenCode2);
         let plan_v1 = fx.install(&v1, &models, &config, None);
         let plan_v2 = fx.install(&v2, &models, &config, None);
 
@@ -651,7 +744,7 @@ mod tests {
             created_secret: Some(PROVIDER_ID.into()),
             ..HarnessRecord::default()
         };
-        let v2 = fx.harness::<V2>();
+        let v2 = fx.harness(App::OpenCode2);
         assert_eq!(v2.inherited_record(&state), None, "no opencode 1 record");
 
         state
@@ -674,6 +767,289 @@ mod tests {
             inherited.created_secret, None,
             "auth.json is not opencode 2's"
         );
-        assert_eq!(fx.harness::<V1>().inherited_record(&state), None);
+        assert_eq!(fx.harness(App::OpenCode1).inherited_record(&state), None);
+    }
+
+    #[test]
+    fn effort_variants_go_on_one_line_each() {
+        let fx = Fixture::new();
+        let config_path = fx.write_config(
+            "opencode.jsonc",
+            r#"{
+  "providers": {
+    "litellm": {
+      "models": {
+        "m": {
+          "variants": [
+            {
+              "id": "low",
+              "settings": {
+                "reasoningEffort": "low"
+              }
+            },
+            {
+              "id": "batch",
+              "body": {"service_tier": "flex"}
+            }
+          ]
+        }
+      }
+    }
+  }
+}
+"#,
+        );
+        cli::tests::fake_cli(&fx.paths, "[]");
+        let config = Config::default();
+        let models = vec![spec("m", true)];
+        let v2 = fx.harness(App::OpenCode2);
+        fx.apply(&fx.install(&v2, &models, &config, None)).unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        for level in ["low", "medium", "high"] {
+            let line = format!(
+                "{{ \"id\": \"{level}\", \"settings\": {{ \"reasoningEffort\": \"{level}\" }} }}"
+            );
+            assert!(text.contains(&line), "{text}");
+        }
+        assert!(
+            text.contains("{\n              \"id\": \"batch\","),
+            "a hand-written variant keeps its layout: {text}"
+        );
+        let again = fx.install(&v2, &models, &config, None);
+        assert!(
+            !again
+                .changes
+                .iter()
+                .any(|c| matches!(c, Change::File { .. })),
+            "{:?}",
+            again.changes
+        );
+
+        let v1 = fx.harness(App::OpenCode1);
+        fx.apply(&fx.install(&v1, &models, &config, None)).unwrap();
+        let text = std::fs::read_to_string(&config_path).unwrap();
+        assert!(
+            text.contains("\"low\": { \"reasoningEffort\": \"low\" }"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn writes_kilo_files_and_leaves_opencode_alone() {
+        let fx = Fixture::new();
+        let kilo = fx.harness(App::Kilo);
+        let seeded = fx.write_in(
+            &fx.paths.kilo_config_dir,
+            "kilo.jsonc",
+            "{\n  \"$schema\": \"https://app.kilo.ai/config.json\"\n}",
+        );
+        assert!(kilo.detect() && !kilo.is_installed());
+
+        let models = vec![spec("gpt-6-luna", true)];
+        let plan = fx.install(&kilo, &models, &Config::default(), None);
+        fx.apply(&plan).unwrap();
+        let value = read(&seeded);
+        assert_eq!(value["$schema"], json!("https://app.kilo.ai/config.json"));
+        let provider = &value["provider"]["litellm"];
+        assert_eq!(
+            provider["options"]["baseURL"],
+            json!("https://llm.example.com/v1")
+        );
+        assert_eq!(
+            provider["models"]["gpt-6-luna"]["variants"]["low"],
+            json!({"reasoningEffort": "low"})
+        );
+        let auth_path = fx.paths.kilo_data_dir.join("auth.json");
+        assert_eq!(
+            read(&auth_path)["litellm"],
+            json!({"type": "api", "key": "sk-1"})
+        );
+        assert!(!fx.paths.opencode_config_dir.exists());
+        assert!(!fx.paths.opencode_data_dir.exists());
+        assert!(fx.backup("kilo/kilo.jsonc").exists());
+
+        let record = plan.record.unwrap();
+        let again = fx.install(&kilo, &models, &Config::default(), Some(&record));
+        assert!(again.changes.is_empty(), "{:?}", again.changes);
+
+        fx.apply(&kilo.plan_uninstall(&record).unwrap()).unwrap();
+        assert_eq!(
+            read(&seeded),
+            json!({"$schema": "https://app.kilo.ai/config.json"})
+        );
+        assert!(read(&auth_path).get("litellm").is_none());
+        assert!(!fx.paths.vscode_user_dir.join("settings.json").exists());
+    }
+
+    #[test]
+    fn writes_the_config_kilo_saves_to() {
+        let fx = Fixture::new();
+        let kilo = fx.harness(App::Kilo);
+        let config = fx.write_in(&fx.paths.kilo_config_dir, "opencode.json", "{}");
+        fx.write_in(&fx.paths.kilo_config_dir, "config.json", "{}");
+        let plan = fx.install(&kilo, &[spec("m", false)], &Config::default(), None);
+        fx.apply(&plan).unwrap();
+        assert!(read(&config)["provider"]["litellm"].is_object());
+        assert!(!fx.paths.kilo_config_dir.join("kilo.jsonc").exists());
+
+        let fresh = Fixture::new();
+        let plan = fresh.install(
+            &fresh.harness(App::Kilo),
+            &[spec("m", false)],
+            &Config::default(),
+            None,
+        );
+        fresh.apply(&plan).unwrap();
+        let created = read(&fresh.paths.kilo_config_dir.join("kilo.jsonc"));
+        assert_eq!(created["$schema"], json!("https://app.kilo.ai/config.json"));
+    }
+
+    #[test]
+    fn kilo_uses_only_litellm_and_restores_on_uninstall() {
+        let fx = Fixture::new();
+        let kilo_config = fx.write_in(
+            &fx.paths.kilo_config_dir,
+            "kilo.jsonc",
+            "{\n  // keep\n  \"share\": \"manual\",\n  \"experimental\": {\"batch_tool\": true}\n}\n",
+        );
+        std::fs::create_dir_all(
+            fx.paths
+                .vscode_extensions_dir
+                .join("kilocode.kilo-code-7.8.14-darwin-arm64"),
+        )
+        .unwrap();
+        let vscode_settings = fx.write_in(
+            &fx.paths.vscode_user_dir,
+            "settings.json",
+            "{\n  // mine\n  \"editor.fontSize\": 14\n}\n",
+        );
+        let config = Config {
+            kilo_model: Some("big".into()),
+            kilo_small_model: Some("small".into()),
+            ..Config::default()
+        };
+        let models = vec![spec("big", true), spec("small", false)];
+        let kilo = fx.harness(App::Kilo);
+        let plan = fx.install(&kilo, &models, &config, None);
+        fx.apply(&plan).unwrap();
+
+        let text = std::fs::read_to_string(&kilo_config).unwrap();
+        assert!(text.contains("// keep"));
+        let value = jsonc::read_value(&text).unwrap();
+        assert_eq!(value["enabled_providers"], json!(["litellm"]));
+        assert_eq!(value["share"], json!("disabled"));
+        assert_eq!(value["remote_control"], json!(false));
+        assert_eq!(
+            value["experimental"],
+            json!({"batch_tool": true, "openTelemetry": false})
+        );
+        assert_eq!(value["model"], json!("litellm/big"));
+        assert_eq!(value["small_model"], json!("litellm/small"));
+
+        let text = std::fs::read_to_string(&vscode_settings).unwrap();
+        assert!(text.contains("// mine"));
+        assert_eq!(
+            jsonc::read_value(&text).unwrap(),
+            json!({
+                "editor.fontSize": 14,
+                "kilo-code.new.autocomplete.enableAutoTrigger": false,
+                "kilo-code.new.model.providerID": "litellm",
+                "kilo-code.new.model.modelID": "big"
+            })
+        );
+
+        let record = plan.record.unwrap();
+        assert_eq!(record.previous["kilo:share"], json!("manual"));
+        assert_eq!(
+            record.previous["kilo:experimental/openTelemetry"],
+            Value::Null
+        );
+        let again = fx.install(&kilo, &models, &config, Some(&record));
+        assert!(again.changes.is_empty(), "{:?}", again.changes);
+        assert_eq!(again.record.unwrap().previous, record.previous);
+
+        fx.apply(&kilo.plan_uninstall(&record).unwrap()).unwrap();
+        let text = std::fs::read_to_string(&kilo_config).unwrap();
+        assert!(text.contains("// keep"));
+        assert_eq!(
+            jsonc::read_value(&text).unwrap(),
+            json!({"share": "manual", "experimental": {"batch_tool": true}})
+        );
+        let text = std::fs::read_to_string(&vscode_settings).unwrap();
+        assert!(text.contains("// mine"));
+        assert_eq!(
+            jsonc::read_value(&text).unwrap(),
+            json!({"editor.fontSize": 14})
+        );
+    }
+
+    #[test]
+    fn kilo_models_are_set_only_when_installed() {
+        let fx = Fixture::new();
+        let config = Config {
+            kilo_model: Some("gone".into()),
+            kilo_small_model: Some("m".into()),
+            ..Config::default()
+        };
+        let plan = fx.install(&fx.harness(App::Kilo), &[spec("m", false)], &config, None);
+        fx.apply(&plan).unwrap();
+        let value = read(&fx.paths.kilo_config_dir.join("kilo.jsonc"));
+        assert!(value.get("model").is_none());
+        assert_eq!(value["small_model"], json!("litellm/m"));
+    }
+
+    #[test]
+    fn kilo_writes_each_vscode_profile_with_its_own_settings() {
+        let fx = Fixture::new();
+        let user = &fx.paths.vscode_user_dir;
+        std::fs::create_dir_all(
+            fx.paths
+                .vscode_extensions_dir
+                .join("kilocode.kilo-code-7.8.14"),
+        )
+        .unwrap();
+        fx.write_in(
+            &user.join("globalStorage"),
+            "storage.json",
+            &json!({"userDataProfiles": [
+                {"location": "-24b23f00", "name": "DSA"},
+                {"location": "builtin/agents", "name": "Agents",
+                 "useDefaultFlags": {"settings": true}}
+            ]})
+            .to_string(),
+        );
+        let dsa = fx.write_in(
+            &user.join("profiles/-24b23f00"),
+            "settings.json",
+            r#"{"kilo-code.new.autocomplete.enableAutoTrigger": true}"#,
+        );
+        let config = Config {
+            kilo_model: Some("m".into()),
+            ..Config::default()
+        };
+        let kilo = fx.harness(App::Kilo);
+        let plan = fx.install(&kilo, &[spec("m", false)], &config, None);
+        fx.apply(&plan).unwrap();
+
+        let expected = json!({
+            "kilo-code.new.autocomplete.enableAutoTrigger": false,
+            "kilo-code.new.model.providerID": "litellm",
+            "kilo-code.new.model.modelID": "m"
+        });
+        assert_eq!(read(&user.join("settings.json")), expected);
+        assert_eq!(read(&dsa), expected);
+        assert!(!user.join("profiles/builtin/agents/settings.json").exists());
+
+        let record = plan.record.unwrap();
+        assert_eq!(
+            record.previous["vscode/profiles/-24b23f00:kilo-code.new.autocomplete.enableAutoTrigger"],
+            json!(true)
+        );
+        fx.apply(&kilo.plan_uninstall(&record).unwrap()).unwrap();
+        assert_eq!(read(&user.join("settings.json")), json!({}));
+        assert_eq!(
+            read(&dsa),
+            json!({"kilo-code.new.autocomplete.enableAutoTrigger": true})
+        );
     }
 }

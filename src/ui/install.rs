@@ -10,6 +10,7 @@ use super::{change_preview, format_cost, format_tokens};
 use crate::cli::InstallArgs;
 use crate::config::{self, Config, Credentials, InstallState};
 use crate::harness::{self, Harness, HarnessId, HarnessPaths, InstallCtx, Plan, cursor, opencode};
+use crate::litellm::budget::cheapest;
 use crate::litellm::{Client, ModelSpec};
 use crate::vscdb::{SecretWriter, StateDb};
 
@@ -61,8 +62,11 @@ pub fn install_with(
     if selected.contains(&HarnessId::Cursor) && !confirm_cursor(&creds.base_url, args.yes)? {
         selected.retain(|id| *id != HarnessId::Cursor);
     }
-    if selected.contains(&HarnessId::Opencode) {
+    if selected.contains(&HarnessId::Opencode) || selected.contains(&HarnessId::Kilo) {
         decide_opencode_long_context(config, &chosen, args.yes)?;
+    }
+    if selected.contains(&HarnessId::Kilo) {
+        decide_kilo_models(config, &chosen, args.yes)?;
     }
 
     let ctx = InstallCtx {
@@ -325,7 +329,7 @@ fn decide_opencode_long_context(
     );
     match config.opencode_approximate_long_context {
         Some(true) => cliclack::log::remark(format!(
-            "opencode: long-context rates are approximated from 200k on.\n{}",
+            "opencode 1 and Kilo Code: long-context rates are approximated from 200k on.\n{}",
             format!("Set by {setting}").dark_grey()
         ))?,
         Some(false) => {}
@@ -349,25 +353,87 @@ fn decide_opencode_long_context(
                 _ => "each model's threshold".to_string(),
             };
             cliclack::log::warning(format!(
-                "opencode can only price long prompts from 200k tokens on.\n\
+                "opencode 1 and Kilo Code can only price long prompts from 200k tokens on.\n\
                  These models switch to their long-context rate later:\n\
                  {}\n\n\
-                 Yes: opencode uses the long-context rate from 200k on,\n\
+                 Yes: the long-context rate is shown from 200k on,\n\
                  \x20    overestimating prompts between 200k and {until}.\n\
-                 No:  opencode shows the normal rate for every prompt.\n\
+                 No:  the normal rate is shown for every prompt.\n\
                  {}",
                 list.join("\n"),
                 "Either way, LiteLLM bills the real rate.".dark_grey()
             ))?;
-            let approximate = cliclack::confirm("Approximate long-context pricing in opencode?")
-                .initial_value(false)
-                .interact()?;
+            let approximate =
+                cliclack::confirm("Approximate long-context pricing in opencode 1 and Kilo Code?")
+                    .initial_value(false)
+                    .interact()?;
             config.opencode_approximate_long_context = Some(approximate);
             config.save()?;
             cliclack::log::remark(format!("Saved. To change it later, edit {setting}"))?;
         }
     }
     Ok(())
+}
+
+fn decide_kilo_models(config: &mut Config, models: &[ModelSpec], yes: bool) -> Result<()> {
+    let model = pick_model(
+        "Default model for Kilo Code",
+        config.kilo_model.as_deref(),
+        models.first(),
+        models,
+        yes,
+    )?;
+    let small_model = pick_model(
+        "Small model for Kilo Code (titles and summaries)",
+        config.kilo_small_model.as_deref(),
+        cheapest(models),
+        models,
+        yes,
+    )?;
+    if config.kilo_model.as_ref() != Some(&model)
+        || config.kilo_small_model.as_ref() != Some(&small_model)
+    {
+        config.kilo_model = Some(model.clone());
+        config.kilo_small_model = Some(small_model.clone());
+        config.save()?;
+    }
+    cliclack::log::remark(format!(
+        "Kilo Code: {model}, and {small_model} for titles and summaries.\n{}",
+        format!(
+            "Change them with {} and {} in {}",
+            "kilo_model".bold(),
+            "kilo_small_model".bold(),
+            config::config_file().display()
+        )
+        .dark_grey()
+    ))?;
+    Ok(())
+}
+
+fn pick_model(
+    prompt: &str,
+    saved: Option<&str>,
+    suggested: Option<&ModelSpec>,
+    models: &[ModelSpec],
+    yes: bool,
+) -> Result<String> {
+    if let Some(id) = saved.filter(|id| models.iter().any(|m| m.id == *id)) {
+        return Ok(id.to_string());
+    }
+    let suggested = suggested.unwrap_or(&models[0]).id.clone();
+    if yes {
+        return Ok(suggested);
+    }
+    let mut select = cliclack::select(prompt).initial_value(suggested);
+    for model in models {
+        let price = format!(
+            "{} / {} per 1M tokens",
+            format_cost(model.pricing.input),
+            format_cost(model.pricing.output)
+        );
+        select = select.item(model.id.clone(), &model.id, price);
+    }
+    Ok(select.interact()?)
 }
 
 /// Previews, confirms, closes apps if needed, backs up, applies and records each plan.

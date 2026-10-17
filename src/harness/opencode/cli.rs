@@ -5,16 +5,14 @@ use std::rc::Rc;
 use anyhow::{Context, Result, bail};
 use serde_json::{Value, json};
 
-use super::{CredentialPlan, CredentialStore, V2, Version};
+use super::KeyChange;
 use crate::config::{HarnessRecord, key_fingerprint};
 use crate::harness::{Change, CommandBackup, CommandStep, PROVIDER_ID, command};
 
-/// The credential liteton owns in opencode 2's credential store.
 pub const CREDENTIAL_ID: &str = "cred_liteton_litellm";
 
 const LABEL: &str = "opencode credentials";
 
-/// The `opencode` binary. opencode 1 and 2 both ship one by that name.
 pub struct OpencodeCli {
     bin: PathBuf,
     major: OnceCell<Option<u32>>,
@@ -36,18 +34,17 @@ impl OpencodeCli {
         })
     }
 
-    fn require(&self, major: u32) -> Result<()> {
+    fn require_v2(&self) -> Result<()> {
         match self.major() {
-            Some(found) if found == major => Ok(()),
+            Some(2) => Ok(()),
             Some(found) => bail!(
-                "`{}` is opencode {found}; opencode {major} is needed to store the API key",
+                "`{}` is opencode {found}; opencode 2 is needed to store the API key",
                 self.bin.display()
             ),
-            None => bail!("opencode {major} was not found on PATH"),
+            None => bail!("opencode 2 was not found on PATH"),
         }
     }
 
-    /// Ids of the stored credentials for `integration`. `auth list` never prints secrets.
     fn credential_ids(&self, integration: &str) -> Result<Vec<String>> {
         let out = command::run(&self.bin, &auth(&["list", "--format", "json"]))?;
         let list: Value =
@@ -80,8 +77,7 @@ fn auth(args: &[&str]) -> CommandStep {
     CommandStep::new(&[&["auth"], args].concat())
 }
 
-/// opencode 2 keeps credentials in its database (auth.json is only imported once), so the key
-/// goes in through `opencode auth`. liteton adds its own credential and makes it active.
+/// opencode 2 imports auth.json only once, so the key goes in through `opencode auth`.
 pub struct CliCredentials {
     cli: Rc<OpencodeCli>,
 }
@@ -92,7 +88,7 @@ impl CliCredentials {
     }
 
     fn removal(&self) -> Result<Option<Change>> {
-        self.cli.require(V2::CLI_MAJOR)?;
+        self.cli.require_v2()?;
         if !self
             .cli
             .credential_ids(PROVIDER_ID)?
@@ -107,19 +103,14 @@ impl CliCredentials {
             true,
         )))
     }
-}
 
-impl CredentialStore for CliCredentials {
-    fn plan_set(&self, api_key: &str, record: Option<&HarnessRecord>) -> Result<CredentialPlan> {
-        self.cli.require(V2::CLI_MAJOR)?;
+    pub fn plan_set(&self, api_key: &str, record: Option<&HarnessRecord>) -> Result<KeyChange> {
+        self.cli.require_v2()?;
         let existing = self.cli.credential_ids(PROVIDER_ID)?;
         let ours = existing.iter().any(|id| id == CREDENTIAL_ID);
         let fingerprint = key_fingerprint(api_key);
         if ours && record.and_then(|r| r.key_fingerprint.as_ref()) == Some(&fingerprint) {
-            return Ok(CredentialPlan {
-                fingerprint: Some(fingerprint),
-                ..CredentialPlan::default()
-            });
+            return Ok(KeyChange::default());
         }
         let mut steps = Vec::new();
         let mut summary = Vec::new();
@@ -141,27 +132,18 @@ impl CredentialStore for CliCredentials {
         if existing.iter().any(|id| id != CREDENTIAL_ID) {
             summary.push("make it the active LiteLLM credential (the others are kept)".to_string());
         }
-        Ok(CredentialPlan {
+        Ok(KeyChange {
             change: Some(self.cli.change(summary, steps, !existing.is_empty())),
             created: (!ours).then(|| CREDENTIAL_ID.to_string()),
-            fingerprint: Some(fingerprint),
-            note: None,
         })
     }
 
-    /// Without a working opencode 2 CLI, uninstall still goes ahead and says what is left.
-    fn plan_remove(&self) -> Result<CredentialPlan> {
-        Ok(match self.removal() {
-            Ok(change) => CredentialPlan {
-                change,
-                ..CredentialPlan::default()
-            },
-            Err(e) => CredentialPlan {
-                note: Some(format!(
-                    "{e:#}. Remove the \"liteton\" credential later with `opencode auth logout {PROVIDER_ID} {CREDENTIAL_ID}`."
-                )),
-                ..CredentialPlan::default()
-            },
+    pub fn plan_remove(&self, notes: &mut Vec<String>) -> Option<Change> {
+        self.removal().unwrap_or_else(|e| {
+            notes.push(format!(
+                "{e:#}. Remove the \"liteton\" credential later with `opencode auth logout {PROVIDER_ID} {CREDENTIAL_ID}`."
+            ));
+            None
         })
     }
 }
@@ -222,7 +204,7 @@ esac
             cli.credential_ids(PROVIDER_ID).unwrap(),
             ["cred_a", "cred_b"]
         );
-        assert!(cli.require(1).is_err());
+        assert!(cli.require_v2().is_ok());
     }
 
     #[test]
@@ -230,8 +212,8 @@ esac
         let dir = tempfile::tempdir().unwrap();
         let paths = paths_in(dir.path());
         let store = CliCredentials::new(Rc::new(OpencodeCli::new(&paths.opencode_bin)));
-        let plan = store.plan_remove().unwrap();
-        assert!(plan.change.is_none());
-        assert!(plan.note.unwrap().contains("opencode auth logout litellm"));
+        let mut notes = Vec::new();
+        assert!(store.plan_remove(&mut notes).is_none());
+        assert!(notes[0].contains("opencode auth logout litellm"));
     }
 }

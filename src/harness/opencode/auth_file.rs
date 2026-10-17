@@ -3,11 +3,9 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde_json::{Map, Value, json};
 
-use super::{CredentialPlan, CredentialStore};
-use crate::config::HarnessRecord;
+use super::KeyChange;
 use crate::harness::{Change, PROVIDER_ID, read_optional};
 
-/// opencode 1 reads API keys from auth.json in its data folder.
 pub struct AuthFile {
     path: PathBuf,
 }
@@ -17,8 +15,8 @@ impl AuthFile {
         Self { path }
     }
 
-    /// Sets (or with `None`, removes) the provider's entry, keeping all other entries.
-    fn plan(&self, api_key: Option<&str>) -> Result<CredentialPlan> {
+    /// `None` removes liteton's entry; other entries are kept.
+    pub fn plan(&self, api_key: Option<&str>) -> Result<KeyChange> {
         let before = read_optional(&self.path)?;
         let mut auth: Map<String, Value> = match &before {
             Some(text) if !text.trim().is_empty() => serde_json::from_str(text)
@@ -54,20 +52,9 @@ impl AuthFile {
                 "{action} the \"{PROVIDER_ID}\" API key entry (other entries are kept)"
             )],
         });
-        Ok(CredentialPlan {
+        Ok(KeyChange {
             change,
             created: (!existed).then(|| PROVIDER_ID.to_string()),
-            ..CredentialPlan::default()
         })
-    }
-}
-
-impl CredentialStore for AuthFile {
-    fn plan_set(&self, api_key: &str, _record: Option<&HarnessRecord>) -> Result<CredentialPlan> {
-        self.plan(Some(api_key))
-    }
-
-    fn plan_remove(&self) -> Result<CredentialPlan> {
-        self.plan(None)
     }
 }

@@ -50,7 +50,7 @@ pub fn apply(plan: &Plan, backup_dir: &Path, secrets: Option<&SecretWriter>) -> 
                     DbValue::Secret(plaintext) => Some(
                         secrets
                             .ok_or_else(|| anyhow!("secret storage is not unlocked"))?
-                            .encode(plaintext.expose()),
+                            .encode(plaintext),
                     ),
                     DbValue::Delete => None,
                 };

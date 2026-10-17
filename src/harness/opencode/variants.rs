@@ -1,30 +1,32 @@
-use jsonc_parser::cst::CstObject;
+use jsonc_parser::cst::{CstObject, CstObjectProp};
 
-use super::Version;
+use super::format::Format;
 use crate::jsonc;
 
-/// Writes one variant per effort level and drops effort variants for levels the model no
-/// longer has. Variants the user wrote themselves are kept.
-pub fn sync<V: Version>(models: &CstObject, model_id: &str, efforts: &[String]) {
+pub fn sync(models: &CstObject, model_id: &str, efforts: &[String], format: Format) {
     let Some(entry) = models.object_value(model_id) else {
         return;
     };
     let prop = entry.get("variants");
     let existing = prop
         .as_ref()
-        .and_then(|p| p.value())
+        .and_then(CstObjectProp::value)
         .and_then(|v| jsonc::node_to_value(&v));
     let mut variants: Vec<_> = efforts
         .iter()
-        .map(|level| (level.clone(), V::effort_variant(level)))
+        .map(|level| (level.clone(), format.effort_variant(level)))
         .collect();
-    for (id, value) in existing.as_ref().map(V::read_variants).unwrap_or_default() {
-        let ours = value == V::effort_variant(&id);
+    for (id, value) in existing
+        .as_ref()
+        .map(|v| format.read_variants(v))
+        .unwrap_or_default()
+    {
+        let ours = value == format.effort_variant(&id);
         if !ours && !efforts.contains(&id) {
             variants.push((id, value));
         }
     }
-    let desired = (!variants.is_empty()).then(|| V::write_variants(variants));
+    let desired = (!variants.is_empty()).then(|| format.write_variants(variants));
     match (prop, desired) {
         (Some(prop), Some(desired)) if existing.as_ref() != Some(&desired) => {
             prop.set_value(jsonc::to_input(&desired));
@@ -41,15 +43,14 @@ pub fn sync<V: Version>(models: &CstObject, model_id: &str, efforts: &[String]) 
 mod tests {
     use serde_json::{Value, json};
 
-    use super::super::{V1, V2};
     use super::*;
 
-    fn synced<V: Version>(variants: Value, efforts: &[&str]) -> Value {
+    fn synced(format: Format, variants: &Value, efforts: &[&str]) -> Value {
         let text = json!({"m": {"variants": variants}}).to_string();
         let root = jsonc::parse(&text).unwrap();
         let models = root.object_value().unwrap();
-        let efforts: Vec<String> = efforts.iter().map(|l| l.to_string()).collect();
-        sync::<V>(&models, "m", &efforts);
+        let efforts: Vec<String> = efforts.iter().map(ToString::to_string).collect();
+        sync(&models, "m", &efforts, format);
         jsonc::read_value(&jsonc::finish(&root, Some(&text))).unwrap()["m"]
             .get("variants")
             .cloned()
@@ -58,8 +59,9 @@ mod tests {
 
     #[test]
     fn v1_drops_effort_variants_the_model_lost() {
-        let variants = synced::<V1>(
-            json!({
+        let variants = synced(
+            Format::V1,
+            &json!({
                 "none": {"reasoningEffort": "none"},
                 "fast": {"reasoningEffort": "low", "textVerbosity": "low"}
             }),
@@ -77,8 +79,9 @@ mod tests {
 
     #[test]
     fn v2_keeps_user_variants_after_ours() {
-        let variants = synced::<V2>(
-            json!([
+        let variants = synced(
+            Format::V2,
+            &json!([
                 {"id": "none", "settings": {"reasoningEffort": "none"}},
                 {"id": "batch", "body": {"service_tier": "flex"}}
             ]),
@@ -95,8 +98,9 @@ mod tests {
 
     #[test]
     fn removes_variants_when_nothing_is_left() {
-        let variants = synced::<V2>(
-            json!([{"id": "low", "settings": {"reasoningEffort": "low"}}]),
+        let variants = synced(
+            Format::V2,
+            &json!([{"id": "low", "settings": {"reasoningEffort": "low"}}]),
             &[],
         );
         assert_eq!(variants, Value::Null);

@@ -1,8 +1,8 @@
 //! In-place JSONC edits that keep comments, ordering and formatting of everything we don't touch.
 
 use anyhow::{Result, anyhow};
-use jsonc_parser::ParseOptions;
 use jsonc_parser::cst::{CstInputValue, CstNode, CstObject, CstRootNode};
+use jsonc_parser::{CollectOptions, ParseOptions, ast};
 use serde_json::{Map, Value};
 
 pub fn parse(text: &str) -> Result<CstRootNode> {
@@ -75,6 +75,88 @@ pub fn finish(root: &CstRootNode, before: Option<&str>) -> String {
     text
 }
 
+/// Puts accepted multi-line objects at `path` (`*` matches any key or index) on one line.
+pub fn inline_objects(
+    text: &str,
+    path: &[&str],
+    inline: impl Fn(&str, &Value) -> bool,
+) -> Result<String> {
+    let parsed =
+        jsonc_parser::parse_to_ast(text, &CollectOptions::default(), &ParseOptions::default())
+            .map_err(|e| anyhow!("{e}"))?;
+    let mut edits = Vec::new();
+    if let Some(root) = &parsed.value {
+        collect_inline(text, root, path, "", &inline, &mut edits);
+    }
+    let mut out = text.to_string();
+    for (range, compact) in edits.into_iter().rev() {
+        out.replace_range(range, &compact);
+    }
+    Ok(out)
+}
+
+fn collect_inline(
+    text: &str,
+    node: &ast::Value,
+    path: &[&str],
+    key: &str,
+    inline: &dyn Fn(&str, &Value) -> bool,
+    edits: &mut Vec<(std::ops::Range<usize>, String)>,
+) {
+    let Some((segment, rest)) = path.split_first() else {
+        if let ast::Value::Object(obj) = node {
+            let range = obj.range.start..obj.range.end;
+            let raw = &text[range.clone()];
+            if raw.contains('\n')
+                && !raw.contains("//")
+                && !raw.contains("/*")
+                && let Ok(value) = read_value(raw)
+                && inline(key, &value)
+            {
+                edits.push((range, one_line(&value)));
+            }
+        }
+        return;
+    };
+    let wanted = |name: &str| *segment == "*" || *segment == name;
+    match node {
+        ast::Value::Object(obj) => {
+            for prop in &obj.properties {
+                let name = prop.name.as_str();
+                if wanted(name) {
+                    collect_inline(text, &prop.value, rest, name, inline, edits);
+                }
+            }
+        }
+        ast::Value::Array(array) => {
+            for (index, element) in array.elements.iter().enumerate() {
+                let name = index.to_string();
+                if wanted(&name) {
+                    collect_inline(text, element, rest, &name, inline, edits);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn one_line(value: &Value) -> String {
+    match value {
+        Value::Object(map) if !map.is_empty() => {
+            let props: Vec<String> = map
+                .iter()
+                .map(|(k, v)| format!("{}: {}", Value::String(k.clone()), one_line(v)))
+                .collect();
+            format!("{{ {} }}", props.join(", "))
+        }
+        Value::Array(items) => {
+            let items: Vec<String> = items.iter().map(one_line).collect();
+            format!("[{}]", items.join(", "))
+        }
+        other => other.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,5 +193,54 @@ mod tests {
             json!({"a": {"b": [1, 2], "c": 0.05}}).as_object().unwrap(),
         );
         assert_eq!(finish(&root, Some(text)), text);
+    }
+
+    #[test]
+    fn inlines_only_accepted_objects_at_the_path() {
+        let text = r#"{
+  // keep
+  "v": [
+    {
+      "id": "low",
+      "settings": {
+        "reasoningEffort": "low"
+      }
+    },
+    {
+      "id": "mine",
+      "body": {"a": 1}
+    },
+    {
+      // a note
+      "id": "high"
+    },
+    { "id": "medium" }
+  ],
+  "other": {
+    "id": "low"
+  }
+}
+"#;
+        let out = inline_objects(text, &["v", "*"], |_, v| v["id"] != "mine").unwrap();
+        assert!(out.contains(
+            "    { \"id\": \"low\", \"settings\": { \"reasoningEffort\": \"low\" } },\n"
+        ));
+        assert!(
+            out.contains("    {\n      \"id\": \"mine\""),
+            "rejected: {out}"
+        );
+        assert!(out.contains("// a note"), "comments stay: {out}");
+        assert!(out.contains("    { \"id\": \"medium\" }\n"));
+        assert!(
+            out.contains("\"other\": {\n    \"id\": \"low\"\n  }"),
+            "outside the path: {out}"
+        );
+        assert!(out.contains("// keep"));
+        assert_eq!(read_value(&out).unwrap(), read_value(text).unwrap());
+        let all = inline_objects(&out, &["v", "*"], |_, _| true).unwrap();
+        assert!(
+            all.contains("{ \"id\": \"mine\", \"body\": { \"a\": 1 } }"),
+            "{all}"
+        );
     }
 }

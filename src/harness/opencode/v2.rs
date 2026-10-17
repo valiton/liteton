@@ -1,92 +1,40 @@
-use std::rc::Rc;
-
 use jsonc_parser::cst::CstObject;
 use serde_json::{Map, Value, json};
 
-use super::cli::CliCredentials;
-use super::{OpencodeCli, V1, Version, input_modalities, limit};
-use crate::config::{Config, HarnessRecord, InstallState};
-use crate::harness::{HarnessId, HarnessPaths, PROVIDER_ID};
+use super::format::{input_modalities, limit};
 use crate::jsonc;
 use crate::litellm::{ModelSpec, Pricing};
 
 const PACKAGE: &str = "aisdk:@ai-sdk/openai-compatible";
 
-/// opencode 2: `providers`, the key in opencode's credential store, any number of price tiers.
-pub struct V2;
-
-impl Version for V2 {
-    const HARNESS: HarnessId = HarnessId::Opencode2;
-    const ROOT_KEY: &'static str = "providers";
-    const CLI_MAJOR: u32 = 2;
-    const HINT: &'static str = "opencode 2: run /models; the models are listed under \"LiteLLM\".";
-    type Store = CliCredentials;
-
-    fn store(_paths: &HarnessPaths, cli: Rc<OpencodeCli>) -> CliCredentials {
-        CliCredentials::new(cli)
-    }
-
-    /// A package the user chose is kept.
-    fn set_connection(provider: &CstObject, base_url: &str) {
-        jsonc::set_if_missing(provider, "package", &json!(PACKAGE));
-        jsonc::merge_object(
-            provider,
-            json!({"settings": {"baseURL": base_url}})
-                .as_object()
-                .unwrap(),
-        );
-    }
-
-    fn model_entry(model: &ModelSpec, _config: &Config) -> Value {
-        let mut entry = Map::new();
-        entry.insert("name".into(), json!(model.display_name));
-        entry.insert(
-            "capabilities".into(),
-            json!({"tools": model.tool_calling, "input": input_modalities(model), "output": ["text"]}),
-        );
-        if let Some(limit) = limit(model) {
-            entry.insert("limit".into(), limit);
-        }
-        if let Some(cost) = tiered_cost(model) {
-            entry.insert("cost".into(), cost);
-        }
-        Value::Object(entry)
-    }
-
-    fn effort_variant(level: &str) -> Value {
-        json!({"id": level, "settings": {"reasoningEffort": level}})
-    }
-
-    fn read_variants(variants: &Value) -> Vec<(String, Value)> {
-        variants
-            .as_array()
-            .into_iter()
-            .flatten()
-            .map(|v| (v["id"].as_str().unwrap_or_default().to_string(), v.clone()))
-            .collect()
-    }
-
-    fn write_variants(variants: Vec<(String, Value)>) -> Value {
-        Value::Array(variants.into_iter().map(|(_, v)| v).collect())
-    }
-
-    /// After the user migrates, liteton's models live under `providers`, and the opencode 1
-    /// record still says which ones liteton added. Its auth.json key is not ours to remove.
-    fn inherited_record(config: Option<&Value>, state: &InstallState) -> Option<HarnessRecord> {
-        if config.is_some_and(|v| v[V1::ROOT_KEY][PROVIDER_ID].is_object()) {
-            return None;
-        }
-        let v1 = state.harnesses.get(V1::HARNESS.key())?;
-        Some(HarnessRecord {
-            added_models: v1.added_models.clone(),
-            created_provider: v1.created_provider,
-            ..HarnessRecord::default()
-        })
-    }
+pub fn set_connection(provider: &CstObject, base_url: &str) {
+    jsonc::set_if_missing(provider, "package", &json!(PACKAGE));
+    jsonc::merge_object(
+        provider,
+        json!({"settings": {"baseURL": base_url}})
+            .as_object()
+            .unwrap(),
+    );
 }
 
-/// opencode 2 takes any number of context tiers: past `size` prompt tokens (input plus cache),
-/// the highest matching tier prices the whole request, like LiteLLM's `above_<N>k_tokens`.
+pub fn model_entry(model: &ModelSpec) -> Value {
+    let mut entry = Map::new();
+    entry.insert("name".into(), json!(model.display_name));
+    entry.insert(
+        "capabilities".into(),
+        json!({"tools": model.tool_calling, "input": input_modalities(model), "output": ["text"]}),
+    );
+    if let Some(limit) = limit(model) {
+        entry.insert("limit".into(), limit);
+    }
+    if let Some(cost) = tiered_cost(model) {
+        entry.insert("cost".into(), cost);
+    }
+    Value::Object(entry)
+}
+
+/// Past `size` prompt tokens (input plus cache), the highest matching tier prices the whole
+/// request, like LiteLLM's `above_<N>k_tokens`.
 fn tiered_cost(model: &ModelSpec) -> Option<Value> {
     let base = cost(&model.pricing)?;
     if model.tiers.is_empty() {
@@ -105,7 +53,6 @@ fn tiered_cost(model: &ModelSpec) -> Option<Value> {
     Some(Value::Array(costs))
 }
 
-/// Cache rates nest under `cache`.
 fn cost(pricing: &Pricing) -> Option<Map<String, Value>> {
     let (Some(input), Some(output)) = (pricing.input, pricing.output) else {
         return None;
@@ -154,7 +101,7 @@ mod tests {
                 },
             },
         ];
-        let entry = V2::model_entry(&haiku, &Config::default());
+        let entry = model_entry(&haiku);
         assert_eq!(
             entry["cost"],
             json!([
@@ -165,7 +112,7 @@ mod tests {
         );
         haiku.tiers.clear();
         assert_eq!(
-            V2::model_entry(&haiku, &Config::default())["cost"],
+            model_entry(&haiku)["cost"],
             json!({"input": 0.05, "output": 0.4, "cache": {"read": 0.01}})
         );
     }

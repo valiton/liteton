@@ -4,25 +4,23 @@ use std::process::{Command, Stdio};
 
 use anyhow::{Context, Result, bail};
 
-use super::Secret;
-
 #[derive(Debug, Clone, PartialEq)]
 pub struct CommandStep {
     pub args: Vec<String>,
-    pub stdin: Option<Secret>,
+    pub stdin: Option<String>,
 }
 
 impl CommandStep {
     pub fn new(args: &[&str]) -> Self {
         Self {
-            args: args.iter().map(|a| a.to_string()).collect(),
+            args: args.iter().map(ToString::to_string).collect(),
             stdin: None,
         }
     }
 
-    pub fn with_stdin(self, stdin: impl Into<Secret>) -> Self {
+    pub fn with_stdin(self, stdin: String) -> Self {
         Self {
-            stdin: Some(stdin.into()),
+            stdin: Some(stdin),
             ..self
         }
     }
@@ -52,7 +50,7 @@ pub fn run(program: &Path, step: &CommandStep) -> Result<String> {
             .stdin
             .take()
             .expect("stdin is piped")
-            .write_all(input.expose().as_bytes())
+            .write_all(input.as_bytes())
             .with_context(|| format!("writing to {shown}"))?;
     }
     let output = child
